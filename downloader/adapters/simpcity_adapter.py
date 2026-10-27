@@ -13,6 +13,9 @@ GOONBOX_IMAGE_RE = re.compile(r"^https?://(?:www\.)?goonbox\.[a-z]{2,}/img/([A-Z
 GOONBOX_ALBUM_RE = re.compile(r"^https?://(?:www\.)?goonbox\.[a-z]{2,}/(?:album|a)/([A-Za-z0-9_-]+)", re.I)
 TURBO_EMBED_RE = re.compile(r"^https?://(?:www\.)?turbo\.[a-z]{2,}/embed/([A-Za-z0-9_-]+)", re.I)
 TURBO_VIDEO_ID_RE = re.compile(r"""const\s+vvid\s*=\s*["']([A-Za-z0-9_-]+)["']""")
+SIMPCITY_ORIGIN = "https://simpcity.cr"
+# Login cookies are only ever sent to the forum, never to file hosts.
+SIMPCITY_COOKIE_DOMAIN = ".simpcity.cr"
 
 
 def unwrap_redirect(href):
@@ -96,13 +99,18 @@ class SimpCityAdapter(RetryingScraper):
                 cookies = [cookies]
             else:
                 for name, value in cookies.items():
-                    self.scraper.cookies.set(name, str(value))
+                    self.scraper.cookies.set(name, str(value), domain=SIMPCITY_COOKIE_DOMAIN, path="/")
                 return
 
         if isinstance(cookies, list):
             for c in cookies:
                 if isinstance(c, dict) and "name" in c and "value" in c:
-                    self.scraper.cookies.set(c["name"], str(c["value"]))
+                    self.scraper.cookies.set(
+                        c["name"],
+                        str(c["value"]),
+                        domain=c.get("domain") or SIMPCITY_COOKIE_DOMAIN,
+                        path=c.get("path") or "/",
+                    )
 
     def fetch_page(self, url):
         return self._request_soup(url, raw=True)

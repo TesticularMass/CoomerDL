@@ -1,5 +1,3 @@
-from concurrent.futures import as_completed
-
 from downloader.core.base_api_downloader import BaseApiDownloader
 from downloader.adapters.coomerfans_adapter import CoomerfansAdapter
 from downloader.adapters.http_retry import ScrapeCancelled
@@ -53,6 +51,8 @@ class CoomerfansDownloader(BaseApiDownloader):
                 download_videos=download_videos,
             )
             default_user_id = resolved.get("folder_name")
+            if self.adapter._failed_posts:
+                self.incomplete_reason = self._translate_text("PROFILE_LISTING_INCOMPLETE")
             self.run_batch(
                 resolved["media"],
                 lambda entry: self.process_media_element(
@@ -103,12 +103,10 @@ class CoomerfansDownloader(BaseApiDownloader):
                 only_first_page=only_first_page,
                 on_media=enqueue_post_media,
             )
+            if self.adapter.scrape_incomplete:
+                self.incomplete_reason = self._translate_text("PROFILE_LISTING_INCOMPLETE")
 
-            for future in as_completed(self.futures):
-                if self.cancel_requested.is_set():
-                    self.log("COOMERFANS_CANCELLING_REMAINING_DOWNLOADS")
-                    break
-                future.result()
+            self.wait_for_futures(self.futures, "COOMERFANS_CANCELLING_REMAINING_DOWNLOADS")
 
             self.log("COOMERFANS_PROFILE_DOWNLOAD_COMPLETE", username=resolved["folder_name"])
         except ScrapeCancelled:

@@ -297,5 +297,16 @@
   "COOMER_REDIRECT_PROFILE_NOT_FOUND": "{name} ({service}) was not found on coomerfans.com.",
   "COOMER_REDIRECT_POST_FAILED": "Couldn't read post {post} from coomer.st: {error}",
   "COOMER_REDIRECT_POST_NOT_FOUND": "Post {post} was not found on coomerfans.com. The model's profile is {profile}",
-  "COOMER_REDIRECT_FAILED": "Redirecting {url} to coomerfans.com failed: {error}"
+  "COOMER_REDIRECT_FAILED": "Redirecting {url} to coomerfans.com failed: {error}",
+  "CK_FAILED_TO_FETCH_USER_POSTS": "Failed to load the post list: {error}",
+  "CK_INVALID_REQUEST_OR_USER_NOT_FOUND": "User {user_id} ({service}) was not found on {site}, or the request was rejected.",
+  "DOWNLOAD_FAILED_WITH_ERROR": "Failed to download {media_url}: {error}",
+  "DOWNLOAD_NO_RESPONSE": "no successful response after {total} attempts",
+  "DOWNLOAD_INTERRUPTED": "Connection lost after {downloaded_size} bytes of {media_url} ({error}).",
+  "RESTARTING_DOWNLOAD": "Restarting {media_url} from the beginning.",
+  "RESUME_NO_PROGRESS": "the server stopped sending data",
+  "UNEXPECTED_DOWNLOAD_ERROR": "Unexpected error while processing {item}: {error}",
+  "PROFILE_LISTING_INCOMPLETE": "Some pages could not be loaded, so posts may be missing. Run the download again later to fetch the rest.",
+  "EROME_PROFILE_PAGE_FAILED": "Could not load profile page {page}: {error}",
+  "COOMER_REDIRECT_SEARCH_INCOMPLETE": "{name} ({service}) was not found on coomerfans.com, but {failed} search page(s) failed to load ({error}). Try again later."
 }

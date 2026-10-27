@@ -26,6 +26,8 @@ class CoomerfansAdapter(RetryingScraper):
         self._cache_hits = 0
         self._cache_misses = 0
         self._failed_posts = []
+        # Set when part of a profile could not be loaded.
+        self.scrape_incomplete = False
         self._init_retry(
             max_retries=max_retries,
             retry_interval=retry_interval,
@@ -119,6 +121,7 @@ class CoomerfansAdapter(RetryingScraper):
                 download_images=download_images,
                 download_videos=download_videos,
             )
+            self.scrape_incomplete = scrape_incomplete or bool(self._failed_posts)
             if on_media and retried_media:
                 on_media(retried_media, base_folder_name)
             media.extend(retried_media)
@@ -144,6 +147,7 @@ class CoomerfansAdapter(RetryingScraper):
             }
         except Exception as e:
             self.log("COOMERFANS_ERROR_RESOLVING_PROFILE", url=profile_url, error=e)
+            self.scrape_incomplete = True
             return {
                 "folder_name": "coomerfans_profile",
                 "media": [],
@@ -300,7 +304,10 @@ class CoomerfansAdapter(RetryingScraper):
                 self.log("COOMERFANS_PROCESSING_POST", url=post_url, post_id=post_id)
                 soup = self._request_soup(post_url)
                 raw_media = self._scrape_post_media(soup, post_url)
-                self._post_cache.store(post_url, raw_media)
+                # An empty result may be a page that failed to render;
+                # caching it would hide the post until the entry expires.
+                if raw_media:
+                    self._post_cache.store(post_url, raw_media)
             else:
                 self._cache_hits += 1
 

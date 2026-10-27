@@ -170,16 +170,35 @@ class CoomerRedirector(RetryingScraper):
             return None
 
         executor = ThreadPoolExecutor(max_workers=SEARCH_WORKERS)
+        failed_pages = 0
+        last_error = None
         try:
             pending = {executor.submit(self._search_page, service, name, p) for p in remaining}
             while pending:
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for future in done:
-                    match = future.result()[2]
+                    try:
+                        match = future.result()[2]
+                    except ScrapeCancelled:
+                        raise
+                    except Exception as e:
+                        # The match may still be on another page.
+                        failed_pages += 1
+                        last_error = e
+                        continue
                     if match:
                         return match
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        if failed_pages:
+            raise self._fail(
+                "COOMER_REDIRECT_SEARCH_INCOMPLETE",
+                name=name,
+                service=service,
+                failed=failed_pages,
+                error=last_error,
+            )
         return None
 
     def _profile_page_posts(self, profile_url, page, cache):

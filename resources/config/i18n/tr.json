@@ -274,5 +274,16 @@
   "COOMER_REDIRECT_PROFILE_NOT_FOUND": "{name} ({service}) coomerfans.com üzerinde bulunamadı.",
   "COOMER_REDIRECT_POST_FAILED": "{post} gönderisi coomer.st üzerinden okunamadı: {error}",
   "COOMER_REDIRECT_POST_NOT_FOUND": "{post} gönderisi coomerfans.com üzerinde bulunamadı. Modelin profili: {profile}",
-  "COOMER_REDIRECT_FAILED": "{url} adresinin coomerfans.com adresine yönlendirilmesi başarısız oldu: {error}"
+  "COOMER_REDIRECT_FAILED": "{url} adresinin coomerfans.com adresine yönlendirilmesi başarısız oldu: {error}",
+  "CK_FAILED_TO_FETCH_USER_POSTS": "Gönderi listesi yüklenemedi: {error}",
+  "CK_INVALID_REQUEST_OR_USER_NOT_FOUND": "{user_id} ({service}) kullanıcısı {site} üzerinde bulunamadı veya istek reddedildi.",
+  "DOWNLOAD_FAILED_WITH_ERROR": "{media_url} indirilemedi: {error}",
+  "DOWNLOAD_NO_RESPONSE": "{total} denemeden sonra başarılı yanıt alınamadı",
+  "DOWNLOAD_INTERRUPTED": "{media_url} için {downloaded_size} bayttan sonra bağlantı koptu ({error}).",
+  "RESTARTING_DOWNLOAD": "{media_url} baştan yeniden indiriliyor.",
+  "RESUME_NO_PROGRESS": "sunucu veri göndermeyi durdurdu",
+  "UNEXPECTED_DOWNLOAD_ERROR": "{item} işlenirken beklenmeyen hata: {error}",
+  "PROFILE_LISTING_INCOMPLETE": "Bazı sayfalar yüklenemedi, bu yüzden bazı gönderiler eksik olabilir. Kalanları almak için indirmeyi daha sonra tekrar çalıştırın.",
+  "EROME_PROFILE_PAGE_FAILED": "Profilin {page}. sayfası yüklenemedi: {error}",
+  "COOMER_REDIRECT_SEARCH_INCOMPLETE": "{name} ({service}) coomerfans.com üzerinde bulunamadı, ancak {failed} arama sayfası yüklenemedi ({error}). Daha sonra tekrar deneyin."
 }

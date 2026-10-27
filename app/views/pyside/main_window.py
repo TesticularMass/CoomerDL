@@ -44,6 +44,7 @@ from app.views.pyside.dialogs.startup_community_dialog import StartupCommunityDi
 VERSION = f"V{APP_VERSION}"
 MAX_LOG_LINES = 500
 LOG_FLUSH_INTERVAL_MS = 150
+CLOSE_CANCEL_WAIT_SECONDS = 3.0
 
 
 class QtSignals(QObject):
@@ -60,6 +61,7 @@ class QtSignals(QObject):
     session_progress = Signal(int, int)
     session_finished = Signal(object)
     reset_progress = Signal()
+    footer_idle_check = Signal()
 
 
 class PySideMainWindow(QMainWindow):
@@ -114,6 +116,7 @@ class PySideMainWindow(QMainWindow):
         self.signals.clear_logs.connect(self._clear_logs)
         self.signals.show_error_box.connect(self._show_error_dialog)
         self.signals.reset_progress.connect(self.clear_progress_bars)
+        self.signals.footer_idle_check.connect(self._schedule_footer_idle_check)
         self.signals.session_item_status.connect(self._on_session_item_status)
         self.signals.session_progress.connect(self._on_session_progress)
         self.signals.session_finished.connect(self._on_session_finished)
@@ -380,7 +383,7 @@ class PySideMainWindow(QMainWindow):
         except Exception as e:
             self.signals.log_message.emit(self.tr("FAILED_TO_EXPORT_LOGS", error=e))
 
-    def update_progress(self, downloaded, total, file_id=None, file_path=None, speed=None, eta=None, status=None):
+    def update_progress(self, downloaded, total, file_id=None, file_path=None, speed=None, eta=None, finished=False):
         if not hasattr(self, "_active_progress"):
             self._active_progress = {}
 
@@ -396,33 +399,38 @@ class PySideMainWindow(QMainWindow):
         if not hasattr(self, "_footer_hold_seconds"):
             self._footer_hold_seconds = 0.8
 
-        if status is not None:
-            self.signals.footer_eta.emit(f"ETA: N/A | STATUS:{status}")
-
         if file_id is None:
             if total and total > 0:
                 self.signals.global_progress.emit(int(downloaded), int(total))
             return
 
-        eta_text = "ETA: N/A"
-        if eta is not None and eta > 0:
-            minutes = int(eta // 60)
-            seconds = int(eta % 60)
-            eta_text = f"ETA: {minutes}m {seconds}s"
+        if finished:
+            # Sent once per file however it ended, so failed downloads and
+            # ones of unknown size do not linger in the totals and list.
+            self.progress_controller.finish_item(
+                file_id=str(file_id),
+                file_path=str(file_path or file_id),
+            )
+        else:
+            eta_text = "ETA: N/A"
+            if eta is not None and eta > 0:
+                minutes = int(eta // 60)
+                seconds = int(eta % 60)
+                eta_text = f"ETA: {minutes}m {seconds}s"
 
-        self.progress_controller.update_item(
-            file_id=str(file_id),
-            file_path=str(file_path or file_id),
-            downloaded=int(downloaded),
-            total=int(total),
-            eta_text=eta_text,
-        )
+            self.progress_controller.update_item(
+                file_id=str(file_id),
+                file_path=str(file_path or file_id),
+                downloaded=int(downloaded),
+                total=int(total),
+                eta_text=eta_text,
+            )
 
         progress_key = f"{file_id}|{file_path}" if file_path else str(file_id)
         now = time.monotonic()
 
         with self._active_progress_lock:
-            if total and total > 0 and int(downloaded) < int(total):
+            if not finished and total and total > 0 and int(downloaded) < int(total):
                 self._active_progress[progress_key] = {
                     "downloaded": int(downloaded),
                     "total": int(total),
@@ -490,6 +498,25 @@ class PySideMainWindow(QMainWindow):
             )
         elif now - self._last_footer_activity_ts > self._footer_hold_seconds:
             self.signals.footer_total_size.emit("Total: 0 B")
+
+        if not has_active_items:
+            # The hold above only re-checks on the next progress event, and
+            # after the last file there is none; clear the footer later.
+            self.signals.footer_idle_check.emit()
+
+    def _schedule_footer_idle_check(self):
+        QTimer.singleShot(int(self._footer_hold_seconds * 1000) + 100, self._clear_idle_footer)
+
+    def _clear_idle_footer(self):
+        with self._active_progress_lock:
+            if self._active_progress:
+                return
+            if time.monotonic() - self._last_footer_activity_ts <= self._footer_hold_seconds:
+                return
+        self._smoothed_total_speed = 0.0
+        self.footer_set_speed("Speed: 0 KB/s")
+        self.footer_set_eta("ETA: N/A")
+        self.footer_set_total_size("Total: 0 B")
 
     def update_global_progress(self, completed_files, total_files):
         self.signals.global_progress.emit(int(completed_files), int(total_files))
@@ -757,6 +784,12 @@ class PySideMainWindow(QMainWindow):
                     self.active_downloader.request_cancel()
                 except Exception:
                     pass
+
+            # Give the workers a moment to notice the cancel and delete
+            # their temporary files; any left behind are swept the next
+            # time the same file is downloaded.
+            if thread_alive:
+                self.download_thread.join(timeout=CLOSE_CANCEL_WAIT_SECONDS)
 
         event.accept()
 

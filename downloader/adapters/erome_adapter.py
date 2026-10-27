@@ -1,12 +1,13 @@
 import os
 import re
 import uuid
-from urllib.parse import urljoin
-
-from bs4 import BeautifulSoup
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from downloader.adapters.http_retry import RetryingScraper, ScrapeCancelled
 from downloader.adapters.resolution_cache import ResolutionCache
+
+# Safety stop for profile pagination; real profiles are far smaller.
+MAX_PROFILE_PAGES = 500
 
 
 class EromeAdapter(RetryingScraper):
@@ -28,6 +29,8 @@ class EromeAdapter(RetryingScraper):
         self._album_cache = ResolutionCache("erome_album_cache", db_path=cache_db_path)
         self._cache_hits = 0
         self._cache_misses = 0
+        # Set when part of a profile could not be loaded.
+        self.scrape_incomplete = False
         self._init_retry(
             max_retries=max_retries,
             retry_interval=retry_interval,
@@ -45,29 +48,69 @@ class EromeAdapter(RetryingScraper):
 
     @staticmethod
     def clean_filename(filename):
-        return re.sub(r'[<>:"/\\|?*]', "_", str(filename).split("?")[0])
+        return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(filename).split("?")[0]).strip().rstrip(" .")
 
-    def _resolve_profile(self, profile_url, soup=None, download_images=True, download_videos=True):
+    @staticmethod
+    def _page_url(url, page):
+        parsed = urlparse(url)
+        query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "page"]
+        query.append(("page", str(page)))
+        return urlunparse(parsed._replace(query=urlencode(query)))
+
+    def _collect_album_urls(self, profile_url, soup, only_first_page):
+        """Album links from every page of the profile, in order."""
+        album_urls = []
+        seen = set()
+        page = 1
+
+        while True:
+            new_links = 0
+            for album_link in soup.find_all("a", class_="album-link"):
+                href = album_link.get("href")
+                if not href:
+                    continue
+                album_url = urljoin(profile_url, href)
+                if album_url in seen:
+                    continue
+                seen.add(album_url)
+                album_urls.append(album_url)
+                new_links += 1
+
+            # A page with nothing new is past the end (or the site clamped
+            # the page number back to an earlier page).
+            if only_first_page or not new_links or page >= MAX_PROFILE_PAGES or self._cancelled():
+                return album_urls
+
+            page += 1
+            try:
+                soup = self._request_soup(self._page_url(profile_url, page))
+            except ScrapeCancelled:
+                return album_urls
+            except Exception as e:
+                if getattr(getattr(e, "response", None), "status_code", None) == 404:
+                    return album_urls  # past the last page
+                self.log("EROME_PROFILE_PAGE_FAILED", page=page, error=e)
+                self.scrape_incomplete = True
+                return album_urls
+
+    def _resolve_profile(self, profile_url, soup=None, download_images=True, download_videos=True,
+                         only_first_page=False):
         soup = soup or self._request_soup(profile_url)
 
         username_tag = soup.find("h1", class_="username")
-        username = username_tag.text.strip() if username_tag else self.tr("EROME_UNKNOWN_PROFILE")
-        base_folder_name = self.clean_filename(username)
+        username = username_tag.get_text(strip=True) if username_tag else ""
+        base_folder_name = self.clean_filename(username) or self.clean_filename(self.tr("EROME_UNKNOWN_PROFILE"))
 
         media = []
-        album_links = soup.find_all("a", class_="album-link")
         self._cache_hits = 0
         self._cache_misses = 0
+        self.scrape_incomplete = False
+        album_urls = self._collect_album_urls(profile_url, soup, only_first_page)
 
-        for album_link in album_links:
+        for album_url in album_urls:
             if self._cancelled():
                 break
 
-            href = album_link.get("href")
-            if not href:
-                continue
-
-            album_url = urljoin(profile_url, href)
             try:
                 album_data = self._resolve_album(
                     album_url,
@@ -81,6 +124,7 @@ class EromeAdapter(RetryingScraper):
                 break
             except Exception as e:
                 self.log("EROME_ERROR_RESOLVING_ALBUM", url=album_url, error=e)
+                self.scrape_incomplete = True
 
         if self._cache_hits or self._cache_misses:
             self.log(
@@ -179,17 +223,23 @@ class EromeAdapter(RetryingScraper):
         if cached is None:
             self._cache_misses += 1
             soup = soup or self._request_soup(album_url)
-            album_title = soup.find("h1").text if soup.find("h1") else self.tr("EROME_UNKNOWN_ALBUM")
+            title_tag = soup.find("h1")
+            album_title = title_tag.get_text(strip=True) if title_tag else ""
             cached = {
                 "album_title": album_title,
                 "items": self._scrape_album_media(soup, album_url),
             }
-            self._album_cache.store(album_url, cached)
+            # An empty result may be a page that failed to render; caching
+            # it would hide the album until the entry expires.
+            if cached["items"]:
+                self._album_cache.store(album_url, cached)
         else:
             self._cache_hits += 1
 
-        album_title = cached.get("album_title") or self.tr("EROME_UNKNOWN_ALBUM")
-        album_folder_name = self.clean_filename(album_title)
+        album_folder_name = (
+            self.clean_filename(cached.get("album_title") or "")
+            or self.clean_filename(self.tr("EROME_UNKNOWN_ALBUM"))
+        )
 
         if inherited_base_folder:
             effective_folder = os.path.join(inherited_base_folder, album_folder_name)

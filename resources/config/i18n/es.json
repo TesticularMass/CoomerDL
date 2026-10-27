@@ -297,5 +297,16 @@
   "COOMER_REDIRECT_PROFILE_NOT_FOUND": "{name} ({service}) no se encontró en coomerfans.com.",
   "COOMER_REDIRECT_POST_FAILED": "No se pudo leer la publicación {post} de coomer.st: {error}",
   "COOMER_REDIRECT_POST_NOT_FOUND": "La publicación {post} no se encontró en coomerfans.com. El perfil del modelo es {profile}",
-  "COOMER_REDIRECT_FAILED": "Falló la redirección de {url} a coomerfans.com: {error}"
+  "COOMER_REDIRECT_FAILED": "Falló la redirección de {url} a coomerfans.com: {error}",
+  "CK_FAILED_TO_FETCH_USER_POSTS": "No se pudo cargar la lista de publicaciones: {error}",
+  "CK_INVALID_REQUEST_OR_USER_NOT_FOUND": "No se encontró el usuario {user_id} ({service}) en {site}, o la solicitud fue rechazada.",
+  "DOWNLOAD_FAILED_WITH_ERROR": "No se pudo descargar {media_url}: {error}",
+  "DOWNLOAD_NO_RESPONSE": "sin respuesta correcta tras {total} intentos",
+  "DOWNLOAD_INTERRUPTED": "Se perdió la conexión tras {downloaded_size} bytes de {media_url} ({error}).",
+  "RESTARTING_DOWNLOAD": "Reiniciando {media_url} desde el principio.",
+  "RESUME_NO_PROGRESS": "el servidor dejó de enviar datos",
+  "UNEXPECTED_DOWNLOAD_ERROR": "Error inesperado al procesar {item}: {error}",
+  "PROFILE_LISTING_INCOMPLETE": "No se pudieron cargar algunas páginas, así que pueden faltar publicaciones. Vuelve a ejecutar la descarga más tarde para obtener el resto.",
+  "EROME_PROFILE_PAGE_FAILED": "No se pudo cargar la página {page} del perfil: {error}",
+  "COOMER_REDIRECT_SEARCH_INCOMPLETE": "No se encontró a {name} ({service}) en coomerfans.com, pero {failed} página(s) de búsqueda no se pudieron cargar ({error}). Inténtalo de nuevo más tarde."
 }

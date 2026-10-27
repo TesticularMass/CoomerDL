@@ -3,6 +3,7 @@ import os
 import requests
 
 from downloader.core.base_api_downloader import BaseApiDownloader
+from downloader.adapters.http_retry import RETRYABLE_STATUS_CODES
 
 
 class Downloader(BaseApiDownloader):
@@ -14,6 +15,53 @@ class Downloader(BaseApiDownloader):
         if "pawchive" in site:
             return "pawchive"
         return "kemono" if "kemono" in site else "coomer"
+
+    def _fetch_posts_page(self, api_url, site, user_id, service):
+        """
+        One page of the post list, with retries. Returns the posts, [] when
+        the user does not exist, or None when the page could not be loaded.
+        """
+        error = None
+        for attempt in range(self.max_retries + 1):
+            if self.cancel_requested.is_set():
+                return None
+
+            response = None
+            try:
+                response = self.session.get(api_url, headers=self.headers, timeout=self.request_timeout)
+                if response.status_code == 400:
+                    self.log("CK_INVALID_REQUEST_OR_USER_NOT_FOUND", site=site, user_id=user_id, service=service)
+                    return []
+                response.raise_for_status()
+                posts = response.json()
+                if isinstance(posts, list):
+                    return posts
+                # An error object instead of a list: retrying will not help.
+                error = ValueError(str(posts)[:200])
+                break
+            except requests.exceptions.HTTPError as e:
+                error = e
+                if response.status_code not in RETRYABLE_STATUS_CODES:
+                    break
+            except (requests.exceptions.RequestException, ValueError) as e:
+                error = e
+
+            if attempt < self.max_retries:
+                delay = self._compute_retry_delay(attempt, response)
+                self.log(
+                    "HTTP_RETRY_REQUEST",
+                    attempt=attempt + 1,
+                    total=self.max_retries + 1,
+                    status_code=response.status_code if response is not None else type(error).__name__,
+                    url=api_url,
+                    delay=round(delay, 1),
+                )
+                if not self._sleep_cancellable(delay):
+                    return None
+
+        self.log("CK_FAILED_TO_FETCH_USER_POSTS", error=error)
+        self.incomplete_reason = self._translate_text("PROFILE_LISTING_INCOMPLETE")
+        return None
 
     def fetch_user_posts(
         self,
@@ -44,42 +92,27 @@ class Downloader(BaseApiDownloader):
             if log_fetching:
                 self.log("CK_FETCHING_USER_POSTS", api_url=api_url)
 
-            try:
-                response = self.session.get(api_url, headers=self.headers, timeout=self.request_timeout)
-                if response.status_code == 400:
-                    self.log("CK_INVALID_REQUEST_OR_USER_NOT_FOUND", site=site, user_id=user_id, service=service)
+            posts = self._fetch_posts_page(api_url, site, user_id, service)
+            if not posts:
+                # End of the list, unknown user, or a page that kept
+                # failing (logged and flagged as incomplete).
+                return all_posts
+
+            for post in posts:
+                if self.cancel_requested.is_set():
                     return all_posts
 
-                response.raise_for_status()
-                posts = response.json()
+                if specific_post_id:
+                    if str(post.get("id")) == str(specific_post_id):
+                        return [post]
+                    continue
 
-                if not posts:
-                    return all_posts
+                all_posts.append(post)
 
-                for post in posts:
-                    if self.cancel_requested.is_set():
-                        return all_posts
+            if only_first_page or len(posts) < 50:
+                return all_posts
 
-                    if specific_post_id:
-                        if str(post.get("id")) == str(specific_post_id):
-                            return [post]
-                        continue
-
-                    all_posts.append(post)
-
-                if only_first_page:
-                    return all_posts
-
-                if len(posts) < 50:
-                    break
-
-                offset += 50
-
-            except requests.exceptions.RequestException as e:
-                self.log("CK_FAILED_TO_FETCH_USER_POSTS", error=e)
-                break
-
-        return all_posts
+            offset += 50
 
     def process_post(self, post, site):
         is_pawchive = "pawchive" in site

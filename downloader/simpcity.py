@@ -2,11 +2,14 @@ import os
 
 from downloader.core.base_api_downloader import BaseApiDownloader
 from downloader.adapters.http_retry import ScrapeCancelled
-from downloader.adapters.simpcity_adapter import SimpCityAdapter
+from downloader.adapters.simpcity_adapter import SIMPCITY_ORIGIN, SimpCityAdapter
 
 
 class SimpCity(BaseApiDownloader):
     def __init__(self, **kwargs):
+        # No User-Agent here: the Cloudflare clearance cookie is tied to the
+        # scraper session's own User-Agent, which must not be overridden.
+        kwargs.setdefault("headers", {"Referer": SIMPCITY_ORIGIN + "/"})
         super().__init__(**kwargs)
         self.adapter = SimpCityAdapter(
             log_callback=self.log_callback,
@@ -15,6 +18,10 @@ class SimpCity(BaseApiDownloader):
             max_retries=self.max_retries,
             retry_interval=self.retry_interval,
         )
+        # Download through the scraping session: forum attachments need its
+        # login cookies and Cloudflare clearance. The cookies are scoped to
+        # the forum's domain, so other file hosts never receive them.
+        self.session = self.adapter.session
         self.domain_name = "simpcity"
 
     def _download_entry(self, entry, target_folder):
@@ -28,10 +35,14 @@ class SimpCity(BaseApiDownloader):
             self.log("SIMPCITY_EMBED_FAILED", url=entry["media_url"], error=e)
             with self.file_lock:
                 self.failed_files.append(entry["media_url"])
+            self._emit_global_progress()
             return
 
         if not files:
             self.log("SIMPCITY_EMBED_EMPTY", url=entry["media_url"])
+            with self.file_lock:
+                self.skipped_files.append(entry["media_url"])
+            self._emit_global_progress()
             return
 
         if len(files) > 1:

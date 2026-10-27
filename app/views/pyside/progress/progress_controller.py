@@ -6,8 +6,13 @@ from app.views.pyside.progress.progress_dialog import ProgressDialog
 
 class ProgressSignals(QObject):
     upsert_item = Signal(str, object, object, str)
+    finish_item = Signal(str)
     clear_all = Signal()
     toggle_dialog = Signal()
+
+
+# How long a finished row stays visible before it is removed.
+FINISHED_ROW_LINGER_MS = 1500
 
 
 class ProgressController:
@@ -20,6 +25,7 @@ class ProgressController:
         self.items = {}
 
         self.signals.upsert_item.connect(self._upsert_item)
+        self.signals.finish_item.connect(self._finish_item)
         self.signals.clear_all.connect(self._clear_all)
         self.signals.toggle_dialog.connect(self._toggle_dialog)
 
@@ -32,6 +38,9 @@ class ProgressController:
     def update_item(self, file_id: str, file_path: str, downloaded: int, total: int, eta_text: str):
         packed_key = self._make_key(str(file_id), str(file_path))
         self.signals.upsert_item.emit(packed_key, downloaded, total, eta_text)
+
+    def finish_item(self, file_id: str, file_path: str):
+        self.signals.finish_item.emit(self._make_key(str(file_id), str(file_path)))
 
     def clear_all(self):
         self.signals.clear_all.emit()
@@ -55,7 +64,11 @@ class ProgressController:
         widget.update_progress(downloaded, total, eta_text)
 
         if total > 0 and downloaded >= total:
-            QTimer.singleShot(1500, lambda key=packed_key: self._remove_item(key))
+            QTimer.singleShot(FINISHED_ROW_LINGER_MS, lambda key=packed_key: self._remove_item(key))
+
+    def _finish_item(self, packed_key: str):
+        if packed_key in self.items:
+            QTimer.singleShot(FINISHED_ROW_LINGER_MS, lambda key=packed_key: self._remove_item(key))
 
     def _remove_item(self, item_key: str):
         removed_any = False

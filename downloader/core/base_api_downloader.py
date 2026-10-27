@@ -2,6 +2,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 from urllib.parse import parse_qsl, urlparse
+import glob
 import os
 import random
 import re
@@ -29,9 +30,31 @@ new_hasher = xxhash.xxh3_128
 # Hex digest length; stored hashes of another length predate XXH3.
 HASH_HEX_LENGTH = 32
 DEFAULT_DB_PATH = os.path.join("resources", "config", "downloads.db")
+# Longest file or folder name written, in UTF-8 bytes. Filesystems allow
+# 255; the margin leaves room for the " (2)" collision suffix and the
+# ".<thread id>.tmp" name used while downloading.
+MAX_FILENAME_BYTES = 200
+# Post titles inside generated names are cut to this many bytes so the
+# index and hash that follow them survive.
+MAX_TITLE_BYTES = 120
+_TMP_SUFFIX_RE = re.compile(r"\.\d+\.tmp")
+
+
+class DownloadCancelled(Exception):
+    """Raised inside a download when the user cancels it."""
+
+
+class DownloadError(Exception):
+    """A download failure whose message is already translated."""
 
 
 class BaseApiDownloader:
+    # Temporary files being written by any downloader in this process;
+    # anything else matching the temporary name pattern is a leftover
+    # from a run that was killed and can be deleted.
+    _active_tmp_paths = set()
+    _active_tmp_lock = threading.Lock()
+
     def __init__(
         self,
         download_folder,
@@ -84,6 +107,9 @@ class BaseApiDownloader:
         self.completed_files = 0
         self.skipped_files = []
         self.failed_files = []
+        # Set when a profile or thread listing could not be fully loaded,
+        # so the session can report the download as partial.
+        self.incomplete_reason = None
         self.tr = tr
         self.shutdown_called = False
         self.folder_structure = folder_structure
@@ -175,7 +201,38 @@ class BaseApiDownloader:
             self.log_callback(domain, final_message)
 
     def sanitize_filename(self, filename):
-        return re.sub(r'[<>:"/\\\\|?*]', "_", filename)
+        return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename)
+
+    @staticmethod
+    def _fit_bytes(name, max_bytes=MAX_FILENAME_BYTES, keep_ext=True):
+        """Shorten a name to max_bytes of UTF-8, keeping its extension."""
+        if len(name.encode("utf-8")) <= max_bytes:
+            return name
+        stem, ext = os.path.splitext(name) if keep_ext else (name, "")
+        if len(ext.encode("utf-8")) > 16:
+            # Not a real extension, just a dot inside a long name.
+            stem, ext = name, ""
+        budget = max_bytes - len(ext.encode("utf-8"))
+        stem = stem.encode("utf-8")[:budget].decode("utf-8", "ignore").rstrip(" .")
+        return (stem or "file") + ext
+
+    def _safe_relative_path(self, name):
+        """
+        Turn a generated or server-supplied name into a relative path that
+        cannot leave the target folder: every component is sanitized and
+        shortened, and empty, "." and ".." components are dropped.
+        """
+        parts = []
+        for raw in re.split(r"[\\/]+", str(name or "")):
+            part = self.sanitize_filename(raw).strip().rstrip(" .")
+            if part.strip("."):
+                parts.append(self._fit_bytes(part))
+        return os.path.join(*parts) if parts else "file"
+
+    def _safe_filename(self, name):
+        """A single file name, without any folder part the server sent."""
+        base = re.split(r"[\\/]+", str(name or ""))[-1]
+        return self._safe_relative_path(base)
 
     def request_cancel(self):
         self.cancel_requested.set()
@@ -183,16 +240,46 @@ class BaseApiDownloader:
         for future in self.futures:
             future.cancel()
 
-    def run_batch(self, items, worker_fn, cancel_log_key=None):
-        self.total_files = len(items)
-        self.completed_files = 0
-        self.futures = [self.executor.submit(worker_fn, item) for item in items]
-        for future in as_completed(self.futures):
+    def _sleep_cancellable(self, seconds):
+        """Sleep in short slices; returns False if the download was cancelled."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        while not self.cancel_requested.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.2, remaining))
+        return False
+
+    def _run_batch_item(self, worker_fn, item):
+        """
+        Run one batch item. Workers handle their own download errors; this
+        catches anything unexpected so one item cannot abort the batch.
+        """
+        try:
+            worker_fn(item)
+        except Exception as e:
+            label = item.get("media_url") if isinstance(item, dict) else item
+            self.log("UNEXPECTED_DOWNLOAD_ERROR", item=label, error=e)
+            with self.file_lock:
+                self.failed_files.append(str(label))
+            self._emit_global_progress()
+
+    def wait_for_futures(self, futures, cancel_log_key=None):
+        for future in as_completed(futures):
             if self.cancel_requested.is_set():
                 if cancel_log_key:
                     self.log(cancel_log_key)
                 break
-            future.result()
+            try:
+                future.result()
+            except Exception as e:
+                self.log("UNEXPECTED_DOWNLOAD_ERROR", item=self.domain_name, error=e)
+
+    def run_batch(self, items, worker_fn, cancel_log_key=None):
+        self.total_files = len(items)
+        self.completed_files = 0
+        self.futures = [self.executor.submit(self._run_batch_item, worker_fn, item) for item in items]
+        self.wait_for_futures(self.futures, cancel_log_key)
 
     def shutdown_executor(self):
         if not self.shutdown_called:
@@ -246,6 +333,12 @@ class BaseApiDownloader:
         def sanitize(name):
             return self.sanitize_filename(name).strip()
 
+        def title_part():
+            title = sanitize(post_name or "")
+            if title:
+                return self._fit_bytes(title, MAX_TITLE_BYTES, keep_ext=False)
+            return f"post_{post_id}" if post_id else "post"
+
         if mode == CUSTOM_TEMPLATE_MODE:
             fields = {
                 "name": name_no_ext,
@@ -272,14 +365,14 @@ class BaseApiDownloader:
             sanitized = sanitize(name_no_ext) or "file"
             return f"{sanitized}_{attachment_index}{extension}"
         elif mode == 1:
-            sanitized_post = sanitize(post_name or "") or (f"post_{post_id}" if post_id else "post")
+            sanitized_post = title_part()
             short_hash = f"{zlib.crc32(media_url.encode('utf-8')) & 0xFFFF:04x}"
             return f"{sanitized_post}_{attachment_index}_{short_hash}{extension}"
         elif mode == 2:
-            sanitized_post = sanitize(post_name or "") or (f"post_{post_id}" if post_id else "post")
+            sanitized_post = title_part()
             return f"{sanitized_post} - {post_id}_{attachment_index}{extension}" if post_id else f"{sanitized_post}_{attachment_index}{extension}"
         elif mode == 3:
-            sanitized_post = sanitize(post_name or "") or (f"post_{post_id}" if post_id else "post")
+            sanitized_post = title_part()
             sanitized_time = sanitize(post_time or "")
             short_hash = f"{zlib.crc32(media_url.encode('utf-8')) & 0xFFFF:04x}"
             return f"{sanitized_time} - {sanitized_post}_{attachment_index}_{short_hash}{extension}"
@@ -503,9 +596,7 @@ class BaseApiDownloader:
         if headers is None:
             headers = self.headers
 
-        parsed = urlparse(url)
-        domain = parsed.netloc
-        path = parsed.path
+        domain = urlparse(url).netloc
 
         for attempt in range(max_retries + 1):
             if self.cancel_requested.is_set():
@@ -522,73 +613,265 @@ class BaseApiDownloader:
                 try:
                     self.domain_last_request[domain] = time.time()
                     response = self.session.get(url, stream=True, headers=headers, timeout=self.request_timeout)
-                    sc = response.status_code
-
                     response.raise_for_status()
                     self._mark_domain_success(domain)
                     return response
-
                 except requests.exceptions.RequestException as e:
-                    error_response = getattr(e, "response", None)
-                    status_code = getattr(error_response, "status_code", None)
-                    is_last_attempt = attempt == max_retries
+                    error = e
 
-                    if status_code in (429, 500, 502, 503, 504):
-                        self._mark_domain_error(domain, status_code)
+            # The failure is handled outside the per-domain slot so other
+            # downloads from this host keep going during the backoff.
+            error_response = getattr(error, "response", None)
+            status_code = getattr(error_response, "status_code", None)
+            is_last_attempt = attempt == max_retries
 
-                    # A 403/404 means the URL itself is wrong or expired, so
-                    # repeating the same request cannot help. Coomer/kemono
-                    give_up = is_last_attempt or status_code in (403, 404)
+            if status_code in (429, 500, 502, 503, 504):
+                self._mark_domain_error(domain, status_code)
 
-                    if give_up:
-                        # These used to exhaust every retry in silence, which
-                        # left failures with no explanation in the log.
-                        self.log(
-                            "FINAL_FAILURE_ACCESSING_URL",
-                            url=url,
-                            status_code=status_code if status_code is not None else e,
-                        )
-                        return None
+            # A 403/404 means the URL itself is wrong or expired, so
+            # repeating the same request cannot help.
+            give_up = is_last_attempt or status_code in (403, 404)
+            retry_delay = None if give_up else self._compute_retry_delay(attempt, error_response)
+            if error_response is not None:
+                error_response.close()
 
-                    retry_delay = self._compute_retry_delay(attempt, error_response)
+            if give_up:
+                self.log(
+                    "FINAL_FAILURE_ACCESSING_URL",
+                    url=url,
+                    status_code=status_code if status_code is not None else error,
+                )
+                return None
 
-                    if status_code in (429, 500, 502, 503, 504):
-                        self.log(
-                            "HTTP_RETRY_REQUEST",
-                            attempt=attempt + 1,
-                            total=max_retries + 1,
-                            status_code=status_code,
-                            url=url,
-                            delay=round(retry_delay, 1),
-                        )
-                    elif isinstance(e, requests.exceptions.ReadTimeout):
-                        self.log(
-                            "READ_TIMEOUT_RETRY",
-                            attempt=attempt + 1,
-                            total=max_retries + 1,
-                            timeout=self.request_timeout[1],
-                        )
-                    else:
-                        url_display = getattr(e.request, "url", url)
-                        if len(url_display) > 60:
-                            url_display = url_display[:60] + "..."
-                        self.log(
-                            "ERROR_ACCESSING_URL",
-                            attempt=attempt + 1,
-                            total=max_retries + 1,
-                            url=url_display,
-                            error=e,
-                        )
+            if status_code in (429, 500, 502, 503, 504):
+                self.log(
+                    "HTTP_RETRY_REQUEST",
+                    attempt=attempt + 1,
+                    total=max_retries + 1,
+                    status_code=status_code,
+                    url=url,
+                    delay=round(retry_delay, 1),
+                )
+            elif isinstance(error, requests.exceptions.ReadTimeout):
+                self.log(
+                    "READ_TIMEOUT_RETRY",
+                    attempt=attempt + 1,
+                    total=max_retries + 1,
+                    timeout=self.request_timeout[1],
+                )
+            else:
+                url_display = getattr(error.request, "url", None) or url
+                if len(url_display) > 60:
+                    url_display = url_display[:60] + "..."
+                self.log(
+                    "ERROR_ACCESSING_URL",
+                    attempt=attempt + 1,
+                    total=max_retries + 1,
+                    url=url_display,
+                    error=error,
+                )
 
-                    time.sleep(retry_delay)
+            if not self._sleep_cancellable(retry_delay):
+                return None
 
         return None
 
     def _emit_global_progress(self):
         if self.update_global_progress_callback:
             with self.file_lock:
-                done = self.completed_files + len(self.skipped_files)
+                # Failed files are finished too; leaving them out kept the
+                # bar below 100% whenever anything failed.
+                done = self.completed_files + len(self.skipped_files) + len(self.failed_files)
             self.update_global_progress_callback(done, self.total_files)
+
+    def _report_progress(self, downloaded, total, start_time, download_id, tmp_path):
+        if not self.update_progress_callback:
+            return
+        elapsed_time = time.time() - start_time
+        speed = downloaded / elapsed_time if elapsed_time > 0 else 0
+        remaining_time = (total - downloaded) / speed if speed > 0 and total > 0 else 0
+        self.update_progress_callback(
+            downloaded,
+            total,
+            file_id=download_id,
+            file_path=tmp_path,
+            speed=speed,
+            eta=remaining_time,
+        )
+
+    def _finish_progress(self, download_id, tmp_path):
+        """Tell the UI this file is done, whether it succeeded or not."""
+        if self.update_progress_callback and download_id is not None:
+            self.update_progress_callback(0, 0, file_id=download_id, file_path=tmp_path, finished=True)
+
+    def _claim_tmp_path(self, final_path, tmp_path):
+        """
+        Register tmp_path as in use and delete temporary files for the same
+        target left behind by a run that was killed mid-download. Runs under
+        the lock so a temporary file another thread is about to create is
+        never mistaken for a leftover.
+        """
+        with BaseApiDownloader._active_tmp_lock:
+            BaseApiDownloader._active_tmp_paths.add(tmp_path)
+            for stale in glob.glob(glob.escape(final_path) + ".*.tmp"):
+                if stale in BaseApiDownloader._active_tmp_paths:
+                    continue
+                if not _TMP_SUFFIX_RE.fullmatch(stale[len(final_path):]):
+                    continue
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+
+    def _release_tmp_path(self, tmp_path):
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        with BaseApiDownloader._active_tmp_lock:
+            BaseApiDownloader._active_tmp_paths.discard(tmp_path)
+
+    @staticmethod
+    def _content_length(response):
+        """Size of the body as written to disk, or 0 when it is unknown."""
+        encoding = (response.headers.get("Content-Encoding") or "identity").strip().lower()
+        if encoding != "identity":
+            # The header counts compressed bytes; iter_content yields
+            # decoded ones, so the two can never be compared.
+            return 0
+        try:
+            return max(0, int(response.headers.get("Content-Length") or 0))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _range_start(response):
+        match = re.match(r"\s*bytes\s+(\d+)-", response.headers.get("Content-Range") or "")
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _stream_error_text(error):
+        """'Connection broken: IncompleteRead(...)' instead of the nested
+        tuple that ChunkedEncodingError prints."""
+        inner = error.args[0] if error.args else None
+        if isinstance(inner, Exception) and inner.args and isinstance(inner.args[0], str):
+            return inner.args[0]
+        return str(error)
+
+    def _write_stream(self, response, tmp_path, mode, hasher, downloaded, total_size, start_time, download_id):
+        """
+        Append the response body to tmp_path. Returns (downloaded, error):
+        a dropped connection is returned instead of raised so the caller
+        knows how many bytes made it to disk and can resume from there.
+        """
+        try:
+            with open(tmp_path, mode) as f:
+                for chunk in response.iter_content(chunk_size=1048576):
+                    if self.cancel_requested.is_set():
+                        raise DownloadCancelled()
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    hasher.update(chunk)
+                    downloaded += len(chunk)
+                    self._report_progress(downloaded, total_size, start_time, download_id, tmp_path)
+        except requests.exceptions.RequestException as e:
+            return downloaded, e
+        finally:
+            response.close()
+        return downloaded, None
+
+    def _request_or_fail(self, url, headers, failure_key, **kwargs):
+        response = self.safe_request(url, max_retries=self.max_retries, headers=headers)
+        if response is None:
+            if self.cancel_requested.is_set():
+                raise DownloadCancelled()
+            raise DownloadError(self._translate_text(failure_key, **kwargs))
+        return response
+
+    def _download_to_tmp(self, media_url, request_headers, fallback_url, tmp_path, download_id):
+        """
+        Download media_url into tmp_path, resuming with Range requests after
+        dropped connections. Returns (size, hash).
+        """
+        request_url = media_url
+        response = self.safe_request(request_url, max_retries=self.max_retries, headers=request_headers)
+
+        if response is None and fallback_url and not self.cancel_requested.is_set():
+            self.log("PAWCHIVE_PREVIEW_FALLBACK", media_url=media_url)
+            request_url = fallback_url
+            response = self.safe_request(request_url, max_retries=self.max_retries, headers=request_headers)
+
+        if response is None:
+            if self.cancel_requested.is_set():
+                raise DownloadCancelled()
+            raise DownloadError(self._translate_text("DOWNLOAD_NO_RESPONSE", total=self.max_retries + 1))
+
+        total_size = self._content_length(response)
+        downloaded = 0
+        hasher = new_hasher()
+        start_time = time.time()
+        # Rounds in a row that added no bytes (known size) or failed
+        # restarts (unknown size); a round that makes progress resets it.
+        failed_rounds = 0
+
+        while True:
+            before = downloaded
+            downloaded, error = self._write_stream(
+                response, tmp_path, "ab" if downloaded else "wb",
+                hasher, downloaded, total_size, start_time, download_id,
+            )
+
+            if total_size and downloaded >= total_size:
+                break
+            if not total_size and error is None:
+                break
+
+            if error is not None:
+                error = self._stream_error_text(error)
+                self.log("DOWNLOAD_INTERRUPTED", media_url=media_url, downloaded_size=downloaded, error=error)
+
+            if total_size and downloaded > before:
+                failed_rounds = 0
+            else:
+                failed_rounds += 1
+            if failed_rounds > self.max_retries:
+                raise DownloadError(error or self._translate_text("RESUME_NO_PROGRESS"))
+
+            if error is not None and not self._sleep_cancellable(self._compute_retry_delay(failed_rounds)):
+                raise DownloadCancelled()
+
+            if total_size:
+                self.log("RESUMING_DOWNLOAD_AT_BYTE", downloaded_size=downloaded, media_url=media_url)
+                response = self._request_or_fail(
+                    request_url,
+                    {**request_headers, "Range": f"bytes={downloaded}-"},
+                    "RESUMPTION_FAILED_AFTER_RETRIES",
+                )
+                if response.status_code == 206 and self._range_start(response) == downloaded:
+                    continue
+                if response.status_code == 206:
+                    # A partial body from the wrong offset cannot be used.
+                    response.close()
+                    response = self._request_or_fail(request_url, request_headers, "RESUMPTION_FAILED_AFTER_RETRIES")
+            else:
+                # Without a known size there is no safe offset to resume from.
+                response = self._request_or_fail(
+                    request_url, request_headers, "DOWNLOAD_NO_RESPONSE", total=self.max_retries + 1
+                )
+
+            self.log("RESTARTING_DOWNLOAD", media_url=media_url)
+            downloaded = 0
+            hasher = new_hasher()
+            total_size = self._content_length(response) or total_size
+
+        if total_size > 0 and downloaded != total_size:
+            raise DownloadError(
+                self._translate_text("FINAL_SIZE_MISMATCH", expected=total_size, actual=downloaded)
+            )
+
+        return downloaded, hasher.hexdigest()
 
     def process_media_element(
         self,
@@ -612,7 +895,9 @@ class BaseApiDownloader:
 
         extension = os.path.splitext(self._filename_from_url(media_url))[1].lower()
 
-        if (extension in self.image_extensions and not self.download_images) or         (extension in self.video_extensions and not self.download_videos) or         (extension in self.compressed_extensions and not self.download_compressed):
+        if (extension in self.image_extensions and not self.download_images) or \
+                (extension in self.video_extensions and not self.download_videos) or \
+                (extension in self.compressed_extensions and not self.download_compressed):
             self.log("SKIPPING_MEDIA_DUE_TO_SETTINGS", media_url=media_url)
             with self.file_lock:
                 self.skipped_files.append(media_url)
@@ -633,9 +918,11 @@ class BaseApiDownloader:
         model_root = self._model_root(media_folder)
 
         if forced_filename and self.file_naming_mode != CUSTOM_TEMPLATE_MODE:
-            filename = forced_filename
+            # Forced names can come straight from a file host's API, so
+            # any folder part is dropped and the rest sanitized.
+            filename = self._safe_filename(forced_filename)
         else:
-            filename = self.get_filename(
+            filename = self._safe_relative_path(self.get_filename(
                 media_url,
                 post_id=post_id,
                 post_name=post_name,
@@ -643,7 +930,7 @@ class BaseApiDownloader:
                 attachment_index=attachment_index,
                 user=user_id or os.path.basename(model_root),
                 forced_name=forced_filename,
-            )
+            ))
 
         final_path = os.path.normpath(os.path.join(media_folder, filename))
         tmp_path = f"{final_path}.{threading.get_ident()}.tmp"
@@ -658,125 +945,19 @@ class BaseApiDownloader:
             self._emit_global_progress()
             return
 
-        os.makedirs(os.path.dirname(final_path), exist_ok=True)
-
-        self.log("STARTING_DOWNLOAD_FROM", media_url=media_url)
-
-        request_url = media_url
-        response = self.safe_request(request_url, max_retries=self.max_retries, headers=request_headers)
-
-        if response is None and fallback_url:
-            self.log("PAWCHIVE_PREVIEW_FALLBACK", media_url=media_url)
-            request_url = fallback_url
-            response = self.safe_request(request_url, max_retries=self.max_retries, headers=request_headers)
-
-        if response is None:
-            self.log(
-                "FAILED_TO_DOWNLOAD_AFTER_ATTEMPTS",
-                media_url=media_url,
-                total=self.max_retries + 1,
-            )
-            with self.file_lock:
-                self.failed_files.append(media_url)
-            return
-
         try:
-            try:
-                total_size = int(response.headers.get("content-length", 0))
-                downloaded_size = 0
-                start_time = time.time()
-                hasher = new_hasher()
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            self._claim_tmp_path(final_path, tmp_path)
+            self.log("STARTING_DOWNLOAD_FROM", media_url=media_url)
 
-                with open(tmp_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=1048576):
-                        if self.cancel_requested.is_set():
-                            raise Exception("CANCELLATION_REQUESTED")
-                        if chunk:
-                            f.write(chunk)
-                            hasher.update(chunk)
-                            downloaded_size += len(chunk)
-                            if self.update_progress_callback:
-                                elapsed_time = time.time() - start_time
-                                speed = downloaded_size / elapsed_time if elapsed_time > 0 else 0
-                                remaining_time = (total_size - downloaded_size) / speed if speed > 0 and total_size > 0 else 0
-                                self.update_progress_callback(
-                                    downloaded_size,
-                                    total_size,
-                                    file_id=download_id,
-                                    file_path=tmp_path,
-                                    speed=speed,
-                                    eta=remaining_time,
-                                )
-            finally:
-                response.close()
-
-            zero_progress_rounds = 0
-            while total_size and downloaded_size < total_size:
-                resume_headers = dict(request_headers)
-                resume_headers["Range"] = f"bytes={downloaded_size}-"
-                self.log(
-                    "RESUMING_DOWNLOAD_AT_BYTE",
-                    downloaded_size=downloaded_size,
-                    media_url=media_url,
-                )
-
-                part_response = self.safe_request(request_url, max_retries=self.max_retries, headers=resume_headers)
-                if part_response is None:
-                    raise Exception("RESUMPTION_FAILED_AFTER_RETRIES")
-
-                try:
-                    if part_response.status_code == 200:
-                        downloaded_size = 0
-                        open_mode = "wb"
-                        hasher = new_hasher()
-                    else:
-                        open_mode = "ab"
-
-                    bytes_before_round = downloaded_size
-
-                    with open(tmp_path, open_mode) as f:
-                        for chunk in part_response.iter_content(chunk_size=1048576):
-                            if self.cancel_requested.is_set():
-                                raise Exception("CANCELLATION_REQUESTED")
-                            if chunk:
-                                f.write(chunk)
-                                hasher.update(chunk)
-                                downloaded_size += len(chunk)
-                                if self.update_progress_callback:
-                                    elapsed_time = time.time() - start_time
-                                    speed = downloaded_size / elapsed_time if elapsed_time > 0 else 0
-                                    remaining_time = (total_size - downloaded_size) / speed if speed > 0 and total_size > 0 else 0
-                                    self.update_progress_callback(
-                                        downloaded_size,
-                                        total_size,
-                                        file_id=download_id,
-                                        file_path=tmp_path,
-                                        speed=speed,
-                                        eta=remaining_time,
-                                    )
-                finally:
-                    part_response.close()
-
-                if downloaded_size == bytes_before_round:
-                    zero_progress_rounds += 1
-                    if zero_progress_rounds >= 3:
-                        raise Exception("RESUME_NO_PROGRESS")
-                else:
-                    zero_progress_rounds = 0
-
-            if total_size > 0 and downloaded_size != total_size:
-                raise Exception(
-                    self._translate_text(
-                        "FINAL_SIZE_MISMATCH",
-                        expected=total_size,
-                        actual=downloaded_size,
-                    )
-                )
+            downloaded_size, file_hash = self._download_to_tmp(
+                media_url, request_headers, fallback_url, tmp_path, download_id
+            )
 
             saved_path, is_duplicate = self._commit_download(
                 tmp_path,
                 final_path,
-                hasher.hexdigest(),
+                file_hash,
                 model_root,
                 record_url,
                 downloaded_size,
@@ -792,24 +973,20 @@ class BaseApiDownloader:
                 self.log("DOWNLOAD_SUCCESS_FROM", media_url=media_url)
             self._emit_global_progress()
 
+        except DownloadCancelled:
+            self.log("DOWNLOAD_CANCELLED_FROM", media_url=media_url)
         except Exception as e:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
-            if str(e) == "CANCELLATION_REQUESTED" or str(e) == self._translate_text("CANCELLATION_REQUESTED"):
+            if self.cancel_requested.is_set():
                 self.log("DOWNLOAD_CANCELLED_FROM", media_url=media_url)
                 return
-
-            self.log(
-                "FAILED_TO_DOWNLOAD_AFTER_ATTEMPTS",
-                media_url=media_url,
-                total=self.max_retries + 1,
-            )
+            self.log("DOWNLOAD_FAILED_WITH_ERROR", media_url=media_url, error=e)
             with self.file_lock:
                 self.failed_files.append(media_url)
+            self._emit_global_progress()
+        finally:
+            self._release_tmp_path(tmp_path)
+            self._finish_progress(download_id, tmp_path)
+
 
     def update_max_downloads(self, new_max):
         try:

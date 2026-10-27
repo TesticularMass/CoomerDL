@@ -53,6 +53,19 @@ def apply_file_settings(downloader, settings: dict):
     downloader.dedupe_by_hash = bool(settings.get("dedupe_by_hash", True))
 
 
+def numeric_setting(settings: dict, key: str, default, cast=float, minimum=0):
+    """Read a number from settings. 0 is a valid value, so it must not fall
+    back to the default the way "value or default" would."""
+    value = settings.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        value = cast(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else cast(minimum)
+
+
 class MainController:
     def __init__(self, app):
         self.app = app
@@ -116,11 +129,11 @@ class MainController:
             "download_videos": request.download_videos,
             "download_compressed": request.download_compressed,
             "folder_structure": settings.get("folder_structure", "default"),
-            "rate_limit_interval": float(settings.get("rate_limit_interval", 0.0) or 0.0),
+            "rate_limit_interval": numeric_setting(settings, "rate_limit_interval", 0.0),
             "tr": self.app.tr,
             "max_workers": self.app.max_downloads,
-            "max_retries": int(settings.get("max_retries", 3) or 3),
-            "retry_interval": float(settings.get("retry_interval", 2.0) or 2.0),
+            "max_retries": numeric_setting(settings, "max_retries", 3, int),
+            "retry_interval": numeric_setting(settings, "retry_interval", 2.0),
             "db_path": settings.get("database_path") or DEFAULT_DB_PATH,
             **extra,
         }
@@ -264,6 +277,9 @@ class MainController:
                         failed_count, completed_count = self._collect_file_stats(
                             job.downloader
                         )
+                        # Set when part of the profile's listing could not
+                        # be loaded, so files may be missing.
+                        incomplete = getattr(job.downloader, "incomplete_reason", None)
 
                         if failed_count and not completed_count:
                             self._mark_item(
@@ -274,14 +290,21 @@ class MainController:
                                     "PROFILE_ALL_FILES_FAILED", failed=failed_count
                                 ),
                             )
-                        elif failed_count:
+                        elif incomplete and not completed_count:
+                            self._mark_item(session, index, ProfileStatus.ERROR, incomplete)
+                        elif failed_count or incomplete:
+                            reasons = []
+                            if failed_count:
+                                reasons.append(
+                                    self.app.tr("PROFILE_SOME_FILES_FAILED", failed=failed_count)
+                                )
+                            if incomplete:
+                                reasons.append(incomplete)
                             self._mark_item(
                                 session,
                                 index,
                                 ProfileStatus.COMPLETED,
-                                self.app.tr(
-                                    "PROFILE_SOME_FILES_FAILED", failed=failed_count
-                                ),
+                                " ".join(reasons),
                             )
                         else:
                             self._mark_item(session, index, ProfileStatus.COMPLETED)
@@ -386,8 +409,8 @@ class MainController:
                 tr=self.app.tr,
                 should_cancel=lambda: session is not None and session.cancel_requested.is_set(),
                 cache_db_path=settings.get("database_path") or DEFAULT_DB_PATH,
-                max_retries=int(settings.get("max_retries", 3) or 3),
-                retry_interval=float(settings.get("retry_interval", 2.0) or 2.0),
+                max_retries=numeric_setting(settings, "max_retries", 3, int),
+                retry_interval=numeric_setting(settings, "retry_interval", 2.0),
             )
             try:
                 new_url = redirector.resolve(request.url)
@@ -432,11 +455,10 @@ class MainController:
             else:
                 self.app.add_log_message_safe("erome", self.app.tr("PROFILE_URL"))
                 method = dl.process_profile_page
-            return DownloadJob(
-                downloader=dl,
-                method=method,
-                args=(request.url, request.download_folder, request.download_images, request.download_videos),
-            ), None
+            args = (request.url, request.download_folder, request.download_images, request.download_videos)
+            if not parsed.is_album:
+                args += (request.only_this_url,)
+            return DownloadJob(downloader=dl, method=method, args=args), None
 
         if parsed.site_type == "bunkr":
             self.app.add_log_message_safe("bunkr", self.app.tr("DOWNLOADING_BUNKR"))
@@ -465,8 +487,6 @@ class MainController:
                 download_images=request.download_images,
                 download_videos=request.download_videos,
                 download_compressed=request.download_compressed,
-                folder_structure=settings.get("folder_structure", "default"),
-                rate_limit_interval=float(settings.get("rate_limit_interval", 0.0) or 0.0),
             )
             site, service, user, post = parsed.host, parsed.service, parsed.user, parsed.post
             if service is None or user is None:
@@ -508,8 +528,6 @@ class MainController:
                 download_images=request.download_images,
                 download_videos=request.download_videos,
                 is_profile_download=parsed.is_profile,
-                folder_structure=settings.get("folder_structure", "default"),
-                rate_limit_interval=float(settings.get("rate_limit_interval", 0.0) or 0.0),
             )
             if parsed.is_post:
                 self.app.add_log_message_safe(self.app.tr("POST_URL"))
