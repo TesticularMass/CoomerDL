@@ -289,5 +289,13 @@
   "SETTINGS_DATABASE_COPY_PROMPT": "Copy your current download records to the new location?\n\nYes: copy them (the old file is kept).\nNo: start with an empty database.",
   "SETTINGS_DATABASE_LOCATION_CHANGED": "The database is now stored at:\n{path}\n\nDownloads already running keep using the previous file.",
   "SETTINGS_DATABASE_USING_EXISTING": "Now using the existing database at:\n{path}\n\nDownloads already running keep using the previous file.",
-  "SETTINGS_ERROR_DATABASE_LOCATION": "Cannot use this database location: {error}"
+  "SETTINGS_ERROR_DATABASE_LOCATION": "Cannot use this database location: {error}",
+  "COOMER_REDIRECT_RESOLVING": "coomer.st blocks downloads; looking up {url} on coomerfans.com...",
+  "COOMER_REDIRECT_DONE": "Redirected {url} to {target}",
+  "COOMER_REDIRECT_INVALID": "Can't redirect {url}: use a coomer.st profile or post link, e.g. coomer.st/onlyfans/user/<name>.",
+  "COOMER_REDIRECT_NAME_FAILED": "Couldn't look up the name of {service} user {user} on coomer.st: {error}",
+  "COOMER_REDIRECT_PROFILE_NOT_FOUND": "{name} ({service}) was not found on coomerfans.com.",
+  "COOMER_REDIRECT_POST_FAILED": "Couldn't read post {post} from coomer.st: {error}",
+  "COOMER_REDIRECT_POST_NOT_FOUND": "Post {post} was not found on coomerfans.com. The model's profile is {profile}",
+  "COOMER_REDIRECT_FAILED": "Redirecting {url} to coomerfans.com failed: {error}"
 }

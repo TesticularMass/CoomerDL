@@ -289,5 +289,13 @@
   "SETTINGS_DATABASE_COPY_PROMPT": "¿Copiar los registros de descargas actuales a la nueva ubicación?\n\nSí: copiarlos (se conserva el archivo anterior).\nNo: empezar con una base de datos vacía.",
   "SETTINGS_DATABASE_LOCATION_CHANGED": "La base de datos ahora se guarda en:\n{path}\n\nLas descargas en curso siguen usando el archivo anterior.",
   "SETTINGS_DATABASE_USING_EXISTING": "Ahora se usa la base de datos existente en:\n{path}\n\nLas descargas en curso siguen usando el archivo anterior.",
-  "SETTINGS_ERROR_DATABASE_LOCATION": "No se puede usar esta ubicación para la base de datos: {error}"
+  "SETTINGS_ERROR_DATABASE_LOCATION": "No se puede usar esta ubicación para la base de datos: {error}",
+  "COOMER_REDIRECT_RESOLVING": "coomer.st bloquea las descargas; buscando {url} en coomerfans.com...",
+  "COOMER_REDIRECT_DONE": "{url} redirigido a {target}",
+  "COOMER_REDIRECT_INVALID": "No se puede redirigir {url}: usa un enlace de perfil o publicación de coomer.st, p. ej. coomer.st/onlyfans/user/<nombre>.",
+  "COOMER_REDIRECT_NAME_FAILED": "No se pudo obtener el nombre del usuario {user} de {service} en coomer.st: {error}",
+  "COOMER_REDIRECT_PROFILE_NOT_FOUND": "{name} ({service}) no se encontró en coomerfans.com.",
+  "COOMER_REDIRECT_POST_FAILED": "No se pudo leer la publicación {post} de coomer.st: {error}",
+  "COOMER_REDIRECT_POST_NOT_FOUND": "La publicación {post} no se encontró en coomerfans.com. El perfil del modelo es {profile}",
+  "COOMER_REDIRECT_FAILED": "Falló la redirección de {url} a coomerfans.com: {error}"
 }

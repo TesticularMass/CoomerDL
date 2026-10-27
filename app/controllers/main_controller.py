@@ -1,11 +1,13 @@
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from app.models.download_request import DownloadRequest
 from app.version import USER_AGENT
 from downloader.bunkr import BunkrDownloader
 from downloader.coomerfans import CoomerfansDownloader
+from downloader.adapters.coomer_redirect import CoomerRedirector, RedirectError
+from downloader.adapters.http_retry import ScrapeCancelled
 from downloader.core.base_api_downloader import DEFAULT_DB_PATH
 from downloader.core.filename_template import DEFAULT_TEMPLATE
 from downloader.downloader import Downloader
@@ -19,7 +21,6 @@ from app.models.profile_session import (
 
 
 DEAD_SITES = {
-    "coomer.st": "coomerfans.com",
     "kemono.cr": "pawchive.pw",
     "jpg5.su": None,
 }
@@ -82,6 +83,9 @@ class MainController:
 
         if parsed.site_type == "unknown":
             return url, self.app.tr("INVALID_URL")
+
+        if parsed.site_type == "coomer_redirect" and not parsed.user:
+            return url, self.app.tr("COOMER_REDIRECT_INVALID", url=url)
 
         return url, None
 
@@ -224,6 +228,9 @@ class MainController:
                 job, error = self._resolve_download_job(item.request)
 
                 if error is not None:
+                    if session.cancel_requested.is_set():
+                        self._mark_item(session, index, ProfileStatus.CANCELLED)
+                        continue
                     if total == 1 and error.show_popup:
                         self.app.show_error(self.app.tr("ERROR"), error.message)
                     self._mark_item(session, index, ProfileStatus.ERROR, error.message)
@@ -370,6 +377,31 @@ class MainController:
         failures instead of popping one dialog per profile.
         """
         parsed = self.app.url_service.parse_download_url(request.url)
+
+        if parsed.site_type == "coomer_redirect":
+            settings = getattr(self.app, "settings", None) or {}
+            session = self.current_session
+            redirector = CoomerRedirector(
+                log_callback=self.app.add_log_message_safe,
+                tr=self.app.tr,
+                should_cancel=lambda: session is not None and session.cancel_requested.is_set(),
+                cache_db_path=settings.get("database_path") or DEFAULT_DB_PATH,
+                max_retries=int(settings.get("max_retries", 3) or 3),
+                retry_interval=float(settings.get("retry_interval", 2.0) or 2.0),
+            )
+            try:
+                new_url = redirector.resolve(request.url)
+            except ScrapeCancelled:
+                return None, JobResolutionError(self.app.tr("DOWNLOAD_CANCELLATION_REQUESTED"), show_popup=False)
+            except RedirectError as e:
+                self.app.add_log_message_safe("coomer", str(e))
+                return None, JobResolutionError(str(e))
+            except Exception as e:
+                message = self.app.tr("COOMER_REDIRECT_FAILED", url=request.url, error=e)
+                self.app.add_log_message_safe("coomer", message)
+                return None, JobResolutionError(message)
+            request = replace(request, url=new_url)
+            parsed = self.app.url_service.parse_download_url(new_url)
 
         host = parsed.host
         dead_site = self._find_dead_site(host)

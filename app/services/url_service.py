@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import ParseResult, parse_qs, urlparse
 
+from downloader.adapters.coomer_redirect import is_coomer_host
+
 
 @dataclass
 class ParsedDownloadUrl:
@@ -70,7 +72,22 @@ class UrlService:
                 is_profile=not is_post,
             )
 
-        if host in ["coomer.st", "kemono.cr", "pawchive.pw"]:
+        if is_coomer_host(host):
+            # Coomer blocks downloads; these links are translated to
+            # coomerfans.com when the download starts.
+            service, user, post = self.extract_ck_parameters(parsed)
+            return ParsedDownloadUrl(
+                parsed_url=parsed,
+                site_type="coomer_redirect",
+                host=host,
+                is_post=post is not None,
+                is_profile=post is None,
+                service=service,
+                user=user,
+                post=post,
+            )
+
+        if host in ["kemono.cr", "pawchive.pw"]:
             service, user, post = self.extract_ck_parameters(parsed)
             query, offset = self.extract_ck_query(parsed)
 

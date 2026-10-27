@@ -266,5 +266,13 @@
   "SETTINGS_DATABASE_COPY_PROMPT": "Mevcut indirme kayıtları yeni konuma kopyalansın mı?\n\nEvet: kopyala (eski dosya korunur).\nHayır: boş bir veritabanıyla başla.",
   "SETTINGS_DATABASE_LOCATION_CHANGED": "Veritabanı artık şurada saklanıyor:\n{path}\n\nDevam eden indirmeler önceki dosyayı kullanmaya devam eder.",
   "SETTINGS_DATABASE_USING_EXISTING": "Artık şu konumdaki mevcut veritabanı kullanılıyor:\n{path}\n\nDevam eden indirmeler önceki dosyayı kullanmaya devam eder.",
-  "SETTINGS_ERROR_DATABASE_LOCATION": "Bu veritabanı konumu kullanılamıyor: {error}"
+  "SETTINGS_ERROR_DATABASE_LOCATION": "Bu veritabanı konumu kullanılamıyor: {error}",
+  "COOMER_REDIRECT_RESOLVING": "coomer.st indirmeleri engelliyor; {url} coomerfans.com üzerinde aranıyor...",
+  "COOMER_REDIRECT_DONE": "{url} adresi {target} adresine yönlendirildi",
+  "COOMER_REDIRECT_INVALID": "{url} yönlendirilemiyor: bir coomer.st profil veya gönderi bağlantısı kullanın, ör. coomer.st/onlyfans/user/<ad>.",
+  "COOMER_REDIRECT_NAME_FAILED": "{service} kullanıcısı {user} için ad coomer.st üzerinden alınamadı: {error}",
+  "COOMER_REDIRECT_PROFILE_NOT_FOUND": "{name} ({service}) coomerfans.com üzerinde bulunamadı.",
+  "COOMER_REDIRECT_POST_FAILED": "{post} gönderisi coomer.st üzerinden okunamadı: {error}",
+  "COOMER_REDIRECT_POST_NOT_FOUND": "{post} gönderisi coomerfans.com üzerinde bulunamadı. Modelin profili: {profile}",
+  "COOMER_REDIRECT_FAILED": "{url} adresinin coomerfans.com adresine yönlendirilmesi başarısız oldu: {error}"
 }

@@ -8,7 +8,7 @@
 # Notice
 
 1. CoomerDL only downloads what a site already serves publicly. It cannot bypass paywalls, logins or private content.
-2. Coomer and Kemono block downloaders. Use **coomerfans.com** and **pawchive.pw** instead (see [Supported sites](#supported-sites)).
+2. Coomer and Kemono block downloaders. coomer.st links are redirected to **coomerfans.com** automatically; for Kemono use **pawchive.pw** (see [Supported sites](#supported-sites)).
 3. This is a personal fork. Report problems with it here, not on the original project.
 
 ## Table of contents
@@ -17,6 +17,7 @@
 - [Description](#description)
 - [What this fork adds](#what-this-fork-adds)
 - [Supported sites](#supported-sites)
+  - [coomer.st links](#coomerst-links)
 - [Installation](#installation)
 - [How to use](#how-to-use)
 - [Settings](#settings)
@@ -52,6 +53,7 @@ This project started as a fork of [Emy69/CoomerDL](https://github.com/Emy69/Coom
 | File naming | 4 fixed modes | ✅ Fixed modes plus custom templates with subfolders |
 | Same name, different file | Overwritten | ✅ Kept as `name (2).ext` |
 | Bunkr files recognised on re-runs | — (signed URLs change every visit) | ✅ |
+| coomer.st links | Rejected | ✅ Redirected to the matching coomerfans profile or post |
 | Paid "full version" upsell | Yes | No |
 
 ## Supported sites
@@ -63,11 +65,25 @@ This project started as a fork of [Emy69/CoomerDL](https://github.com/Emy69/Coom
 | [erome.com](https://www.erome.com/) | ✅ Working | Albums and profiles |
 | [bunkr](https://bunkr-albums.io/) | ✅ Working | Any bunkr domain (bunkr.si, bunkr.site, etc.) |
 | [simpcity.cr](https://simpcity.cr/) | ✅ Working | Includes GoonBox images and turbo.cr videos posted in threads. May require [cookies](#simpcity-cookies) |
-| ~~coomer.st~~ | ❌ Blocked | Use **coomerfans.com** |
+| [coomer.st](https://coomer.st/) | 🔁 Redirected | Profile and post links are looked up on coomerfans.com and downloaded from there (see [coomer.st links](#coomerst-links)) |
 | ~~kemono.cr~~ | ❌ Blocked | Use **pawchive.pw** |
 | ~~jpg5.su~~ | ❌ Not working | Downloads currently fail |
 
 If you paste a URL from a blocked site, the app tells you which working alternative to use instead of trying the download.
+
+### coomer.st links
+
+Coomer blocks downloads, but coomerfans.com mirrors the same creators under its own IDs, so the app translates coomer.st links when the download starts:
+
+```text
+coomer.st/onlyfans/user/mrselliebrooks
+  -> coomerfans.com/u/onlyfans/328453/mrselliebrooks
+```
+
+- **Profiles** are found with the coomerfans search, matching the service and name exactly. Fansly and other numeric IDs are first turned into a name with coomer's API, which still answers metadata requests.
+- **Posts** are matched by their publish time, which both sites share. The app finds the model, then binary-searches the model's date-ordered pages, so even old posts take about ten requests.
+- Results are cached in the download database for 30 days, so repeat downloads skip the lookup.
+- The log shows each redirect. If a model or post isn't on coomerfans, the profile is marked as failed with the reason (for a missing post, the log includes the model's coomerfans profile).
 
 ## Installation
 
