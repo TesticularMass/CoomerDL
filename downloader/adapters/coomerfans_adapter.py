@@ -1,5 +1,6 @@
 import re
-from urllib.parse import urljoin, urlparse
+import time
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -44,7 +45,7 @@ class CoomerfansAdapter(RetryingScraper):
     def clean_filename(filename):
         return re.sub(r'[<>:"/\\|?*]', "_", str(filename).split("?")[0])
 
-    def _resolve_profile(self, profile_url, download_images=True, download_videos=True):
+    def _resolve_profile(self, profile_url, download_images=True, download_videos=True, only_first_page=False, on_media=None):
         """
         Resolves a user profile page and collects all posts.
         URL format: /u/{service}/{user_id}/{username}?page={page}
@@ -66,7 +67,7 @@ class CoomerfansAdapter(RetryingScraper):
 
             media = []
             page = 1
-            max_pages = 100  # Safety limit to prevent infinite loops
+            max_pages = 1 if only_first_page else 100
             seen_post_links = set()
             self._cache_hits = 0
             self._cache_misses = 0
@@ -79,7 +80,7 @@ class CoomerfansAdapter(RetryingScraper):
 
                 try:
                     if page == 1:
-                        page_url = profile_url.split("?")[0]  # Remove existing query params
+                        page_url = profile_url if only_first_page else profile_url.split("?")[0]
                     else:
                         page_url = profile_url.split("?")[0] + f"?page={page}"
 
@@ -93,6 +94,7 @@ class CoomerfansAdapter(RetryingScraper):
                         download_images,
                         download_videos,
                         seen_post_links,
+                        on_media=on_media,
                     )
 
                     if len(seen_post_links) == posts_before:
@@ -113,10 +115,13 @@ class CoomerfansAdapter(RetryingScraper):
             if scrape_incomplete:
                 self.log("COOMERFANS_PROFILE_SCRAPE_INCOMPLETE", page=page)
 
-            media.extend(
-                self._retry_failed_posts(download_images=download_images,
-                                         download_videos=download_videos)
+            retried_media = self._retry_failed_posts(
+                download_images=download_images,
+                download_videos=download_videos,
             )
+            if on_media and retried_media:
+                on_media(retried_media, base_folder_name)
+            media.extend(retried_media)
 
             if self._cache_hits or self._cache_misses:
                 self.log(
@@ -183,7 +188,7 @@ class CoomerfansAdapter(RetryingScraper):
 
         return recovered
 
-    def _extract_profile_posts(self, soup, service, user_id, username, download_images=True, download_videos=True, seen_links=None):
+    def _extract_profile_posts(self, soup, service, user_id, username, download_images=True, download_videos=True, seen_links=None, on_media=None):
         """
         Extracts post links from a profile page.
         Looks for post containers and extracts media from each post.
@@ -210,7 +215,10 @@ class CoomerfansAdapter(RetryingScraper):
                     download_videos=download_videos,
                     profile_user_id=profile_folder,
                 )
-                media.extend(post_media.get("media", []))
+                items = post_media.get("media", [])
+                if on_media and items:
+                    on_media(items, profile_folder)
+                media.extend(items)
             except ScrapeCancelled:
                 raise
             except Exception as e:
@@ -280,6 +288,13 @@ class CoomerfansAdapter(RetryingScraper):
             entry_user_id = profile_user_id or self.clean_filename(f"{service}_{user_id}")
 
             raw_media = self._post_cache.load(post_url)
+            if isinstance(raw_media, list):
+                now = time.time()
+                for item in raw_media:
+                    exp = (parse_qs(urlparse(item.get("media_url") or "").query).get("e") or [None])[0]
+                    if exp and exp.isdigit() and int(exp) < now + 60:
+                        raw_media = None
+                        break
             if not isinstance(raw_media, list):
                 self._cache_misses += 1
                 self.log("COOMERFANS_PROCESSING_POST", url=post_url, post_id=post_id)
@@ -297,8 +312,11 @@ class CoomerfansAdapter(RetryingScraper):
                 if resource_type == "Video" and not download_videos:
                     continue
 
+                m_url = item.get("media_url")
+                stable_path = urlparse(m_url or "").path
                 media.append({
-                    "media_url": item.get("media_url"),
+                    "media_url": m_url,
+                    "record_url": f"https://coomerfans.com{stable_path}" if stable_path else m_url,
                     "post_id": post_id,
                     "title": folder_name,
                     "published": "",

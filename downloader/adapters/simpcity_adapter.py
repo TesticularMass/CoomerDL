@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from downloader.adapters.http_retry import RetryingScraper
+from downloader.adapters.http_retry import RetryingScraper, ScrapeCancelled
 
 # The TLD is left open: these hosts move (jpg5.su became goonbox.cr).
 GOONBOX_IMAGE_RE = re.compile(r"^https?://(?:www\.)?goonbox\.[a-z]{2,}/img/([A-Za-z0-9_-]+)", re.I)
@@ -83,29 +83,29 @@ class SimpCityAdapter(RetryingScraper):
     def set_cookies(self):
         if not os.path.exists(self.cookies_path):
             return
-
-        with open(self.cookies_path, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
+        try:
+            with open(self.cookies_path, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+        except Exception:
+            return
+        if not cookies:
+            return
 
         if isinstance(cookies, dict):
             if "name" in cookies and "value" in cookies:
-                # single browser-export cookie object
                 cookies = [cookies]
             else:
-                # plain name -> value mapping, the format the settings
-                # dialog placeholder suggests
                 for name, value in cookies.items():
                     self.scraper.cookies.set(name, str(value))
                 return
 
-        for c in cookies:
-            if isinstance(c, dict) and "name" in c and "value" in c:
-                self.scraper.cookies.set(c["name"], c["value"])
+        if isinstance(cookies, list):
+            for c in cookies:
+                if isinstance(c, dict) and "name" in c and "value" in c:
+                    self.scraper.cookies.set(c["name"], str(c["value"]))
 
     def fetch_page(self, url):
-        response = self.scraper.get(url, timeout=20)
-        response.raise_for_status()
-        return BeautifulSoup(response.content, "html.parser")
+        return self._request_soup(url, raw=True)
 
     def resolve_thread(self, url, paginate=True, download_images=True, download_videos=True, download_attachments=True):
         self.log("SIMPCITY_PROCESSING_THREAD", url=url)
@@ -116,6 +116,8 @@ class SimpCityAdapter(RetryingScraper):
         folder_name = None
 
         while current_url and current_url not in visited:
+            if self._cancelled():
+                raise ScrapeCancelled()
             visited.add(current_url)
 
             soup = self.fetch_page(current_url)

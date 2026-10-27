@@ -1,14 +1,18 @@
 import datetime
+import threading
 from pathlib import Path
 from html import escape
+
 
 class LogService:
     def __init__(self, log_folder="resources/config/logs/"):
         self.log_folder = Path(log_folder)
         self.all_logs = []
+        self._lock = threading.Lock()
 
     DOMAIN_COLORS = {
         "coomer": "#4FC3F7",
+        "coomerfans": "#4DB6AC",
         "kemono": "#81C784",
         "pawchive": "#A1887F",
         "erome": "#F48FB1",
@@ -40,13 +44,13 @@ class LogService:
 
     def add_domain_log(self, domain: str, message: str):
         plain = self.format_plain(domain, message)
-        self.all_logs.append(plain)
+        with self._lock:
+            self.all_logs.append(plain)
         return self.format_html(domain, message)
 
     def clear_runtime(self):
-        # Start each download run with a fresh log so exports only
-        # contain the current run.
-        self.all_logs.clear()
+        with self._lock:
+            self.all_logs.clear()
 
     def export_logs(
         self,
@@ -58,36 +62,31 @@ class LogService:
         self.log_folder.mkdir(parents=True, exist_ok=True)
         log_file_path = self.log_folder / f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
-        total_files = 0
-        completed_files = 0
-        skipped_files = []
-        failed_files = []
+        total_files = getattr(active_downloader, "total_files", 0) if active_downloader else 0
+        completed_files = getattr(active_downloader, "completed_files", 0) if active_downloader else 0
+        skipped_files = list(getattr(active_downloader, "skipped_files", [])) if active_downloader else []
+        failed_files = list(getattr(active_downloader, "failed_files", [])) if active_downloader else []
 
-        if active_downloader:
-            total_files = getattr(active_downloader, "total_files", 0)
-            completed_files = getattr(active_downloader, "completed_files", 0)
-            skipped_files = getattr(active_downloader, "skipped_files", [])
-            failed_files = getattr(active_downloader, "failed_files", [])
-
-        total_images = completed_files if download_images_enabled else 0
-        total_videos = completed_files if download_videos_enabled else 0
         duration = datetime.datetime.now() - download_start_time if download_start_time else "N/A"
+        nl = chr(10)
+        skipped_files_summary = nl.join(skipped_files)
+        failed_files_summary = nl.join(failed_files)
 
-        skipped_files_summary = "\n".join(skipped_files)
-        failed_files_summary = "\n".join(failed_files)
+        with self._lock:
+            logs_snapshot = list(self.all_logs)
 
         summary = (
-            f"Total de archivos descargados: {total_files}\n"
-            f"Total de imágenes descargadas: {total_images}\n"
-            f"Total de videos descargados: {total_videos}\n"
-            f"Tiempo total de descarga: {duration}\n\n"
-            f"Archivos saltados:\n{skipped_files_summary}\n\n"
-            f"Archivos fallidos:\n{failed_files_summary}\n\n"
+            f"Total de archivos descargados: {completed_files} / {total_files}{nl}"
+            f"Imágenes habilitadas: {download_images_enabled}{nl}"
+            f"Videos habilitados: {download_videos_enabled}{nl}"
+            f"Tiempo total de descarga: {duration}{nl}{nl}"
+            f"Archivos saltados ({len(skipped_files)}):{nl}{skipped_files_summary}{nl}{nl}"
+            f"Archivos fallidos ({len(failed_files)}):{nl}{failed_files_summary}{nl}{nl}"
         )
 
         with open(log_file_path, "w", encoding="utf-8") as file:
             file.write(summary)
-            file.write("\n--- LOGS COMPLETOS ---\n")
-            file.write("\n".join(self.all_logs))
+            file.write(f"{nl}--- LOGS COMPLETOS ---{nl}")
+            file.write(nl.join(logs_snapshot))
 
         return str(log_file_path)

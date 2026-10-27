@@ -384,6 +384,12 @@ class BaseApiDownloader:
 
         return None
 
+    def _emit_global_progress(self):
+        if self.update_global_progress_callback:
+            with self.file_lock:
+                done = self.completed_files + len(self.skipped_files)
+            self.update_global_progress_callback(done, self.total_files)
+
     def process_media_element(
         self,
         media_url,
@@ -396,15 +402,8 @@ class BaseApiDownloader:
         forced_filename=None,
         headers=None,
         record_url=None,
+        fallback_url=None,
     ):
-        """
-        `headers` are merged over the downloader's own for this one file, for
-        hosts that only serve it with a particular Referer.
-
-        `record_url` is what the database remembers the file by. Signed links
-        change on every visit, so for those the caller passes the stable page
-        the link came from; otherwise the same file is fetched again each run.
-        """
         if self.cancel_requested.is_set():
             return
 
@@ -413,18 +412,17 @@ class BaseApiDownloader:
 
         extension = os.path.splitext(self._filename_from_url(media_url))[1].lower()
 
-        if (extension in self.image_extensions and not self.download_images) or \
-        (extension in self.video_extensions and not self.download_videos) or \
-        (extension in self.compressed_extensions and not self.download_compressed):
+        if (extension in self.image_extensions and not self.download_images) or         (extension in self.video_extensions and not self.download_videos) or         (extension in self.compressed_extensions and not self.download_compressed):
             self.log("SKIPPING_MEDIA_DUE_TO_SETTINGS", media_url=media_url)
+            with self.file_lock:
+                self.skipped_files.append(media_url)
+            self._emit_global_progress()
             return
 
-        if post_id:
-            with self.counter_lock:
-                self.post_attachment_counter[post_id] += 1
-                attachment_index = self.post_attachment_counter[post_id]
-        else:
-            attachment_index = 1
+        counter_key = post_id or target_folder or user_id or "default"
+        with self.counter_lock:
+            self.post_attachment_counter[counter_key] += 1
+            attachment_index = self.post_attachment_counter[counter_key]
 
         filename = forced_filename or self.get_filename(
             media_url,
@@ -443,17 +441,27 @@ class BaseApiDownloader:
         os.makedirs(media_folder, exist_ok=True)
 
         final_path = os.path.normpath(os.path.join(media_folder, filename))
-        tmp_path = final_path + ".tmp"
+        tmp_path = f"{final_path}.{threading.get_ident()}.tmp"
 
-        if record_url in self.download_cache:
+        with self.db_lock:
+            already_downloaded = record_url in self.download_cache
+
+        if already_downloaded:
             self.log("FILE_ALREADY_IN_DB_SKIPPING", media_url=record_url)
             with self.file_lock:
                 self.skipped_files.append(final_path)
+            self._emit_global_progress()
             return
 
         self.log("STARTING_DOWNLOAD_FROM", media_url=media_url)
 
-        response = self.safe_request(media_url, max_retries=self.max_retries, headers=request_headers)
+        request_url = media_url
+        response = self.safe_request(request_url, max_retries=self.max_retries, headers=request_headers)
+
+        if response is None and fallback_url:
+            self.log("PAWCHIVE_PREVIEW_FALLBACK", media_url=media_url)
+            request_url = fallback_url
+            response = self.safe_request(request_url, max_retries=self.max_retries, headers=request_headers)
 
         if response is None:
             self.log(
@@ -466,55 +474,13 @@ class BaseApiDownloader:
             return
 
         try:
-            total_size = int(response.headers.get("content-length", 0))
-            downloaded_size = 0
-            start_time = time.time()
+            try:
+                total_size = int(response.headers.get("content-length", 0))
+                downloaded_size = 0
+                start_time = time.time()
 
-            with open(tmp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1048576):
-                    if self.cancel_requested.is_set():
-                        raise Exception("CANCELLATION_REQUESTED")
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        if self.update_progress_callback:
-                            elapsed_time = time.time() - start_time
-                            speed = downloaded_size / elapsed_time if elapsed_time > 0 else 0
-                            remaining_time = (total_size - downloaded_size) / speed if speed > 0 and total_size > 0 else 0
-                            self.update_progress_callback(
-                                downloaded_size,
-                                total_size,
-                                file_id=download_id,
-                                file_path=tmp_path,
-                                speed=speed,
-                                eta=remaining_time,
-                            )
-
-            zero_progress_rounds = 0
-            while total_size and downloaded_size < total_size:
-                resume_headers = dict(request_headers)
-                resume_headers["Range"] = f"bytes={downloaded_size}-"
-                self.log(
-                    "RESUMING_DOWNLOAD_AT_BYTE",
-                    downloaded_size=downloaded_size,
-                    media_url=media_url,
-                )
-
-                part_response = self.safe_request(media_url, max_retries=self.max_retries, headers=resume_headers)
-                if part_response is None:
-                    raise Exception("RESUMPTION_FAILED_AFTER_RETRIES")
-
-                if part_response.status_code == 200:
-                    # Server ignored the Range header and sent the full file again
-                    downloaded_size = 0
-                    open_mode = "wb"
-                else:
-                    open_mode = "ab"
-
-                bytes_before_round = downloaded_size
-
-                with open(tmp_path, open_mode) as f:
-                    for chunk in part_response.iter_content(chunk_size=1048576):
+                with open(tmp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1048576):
                         if self.cancel_requested.is_set():
                             raise Exception("CANCELLATION_REQUESTED")
                         if chunk:
@@ -532,6 +498,53 @@ class BaseApiDownloader:
                                     speed=speed,
                                     eta=remaining_time,
                                 )
+            finally:
+                response.close()
+
+            zero_progress_rounds = 0
+            while total_size and downloaded_size < total_size:
+                resume_headers = dict(request_headers)
+                resume_headers["Range"] = f"bytes={downloaded_size}-"
+                self.log(
+                    "RESUMING_DOWNLOAD_AT_BYTE",
+                    downloaded_size=downloaded_size,
+                    media_url=media_url,
+                )
+
+                part_response = self.safe_request(request_url, max_retries=self.max_retries, headers=resume_headers)
+                if part_response is None:
+                    raise Exception("RESUMPTION_FAILED_AFTER_RETRIES")
+
+                try:
+                    if part_response.status_code == 200:
+                        downloaded_size = 0
+                        open_mode = "wb"
+                    else:
+                        open_mode = "ab"
+
+                    bytes_before_round = downloaded_size
+
+                    with open(tmp_path, open_mode) as f:
+                        for chunk in part_response.iter_content(chunk_size=1048576):
+                            if self.cancel_requested.is_set():
+                                raise Exception("CANCELLATION_REQUESTED")
+                            if chunk:
+                                f.write(chunk)
+                                downloaded_size += len(chunk)
+                                if self.update_progress_callback:
+                                    elapsed_time = time.time() - start_time
+                                    speed = downloaded_size / elapsed_time if elapsed_time > 0 else 0
+                                    remaining_time = (total_size - downloaded_size) / speed if speed > 0 and total_size > 0 else 0
+                                    self.update_progress_callback(
+                                        downloaded_size,
+                                        total_size,
+                                        file_id=download_id,
+                                        file_path=tmp_path,
+                                        speed=speed,
+                                        eta=remaining_time,
+                                    )
+                finally:
+                    part_response.close()
 
                 if downloaded_size == bytes_before_round:
                     zero_progress_rounds += 1
@@ -556,9 +569,7 @@ class BaseApiDownloader:
                 self.completed_files += 1
 
             self.log("DOWNLOAD_SUCCESS_FROM", media_url=media_url)
-
-            if self.update_global_progress_callback:
-                self.update_global_progress_callback(self.completed_files, self.total_files)
+            self._emit_global_progress()
 
             with self.db_lock:
                 self.db_cursor.execute(
@@ -569,8 +580,7 @@ class BaseApiDownloader:
                     (record_url, final_path, total_size, user_id, post_id),
                 )
                 self.db_connection.commit()
-
-            self.download_cache[record_url] = (final_path, total_size)
+                self.download_cache[record_url] = (final_path, total_size)
 
         except Exception as e:
             if os.path.exists(tmp_path):

@@ -89,18 +89,23 @@ class MainController:
 
     def _create_downloader(self, cls, request: DownloadRequest, **extra):
         settings = getattr(self.app, "settings", None) or {}
-        kwargs = dict(
-            download_folder=request.download_folder,
-            log_callback=self.app.add_log_message_safe,
-            enable_widgets_callback=self.app.enable_widgets,
-            update_progress_callback=self.app.update_progress,
-            update_global_progress_callback=self.app.update_global_progress,
-            tr=self.app.tr,
-            max_workers=self.app.max_downloads,
-            max_retries=int(settings.get("max_retries", 3) or 3),
-            retry_interval=float(settings.get("retry_interval", 2.0) or 2.0),
+        kwargs = {
+            "download_folder": request.download_folder,
+            "log_callback": self.app.add_log_message_safe,
+            "enable_widgets_callback": self.app.enable_widgets,
+            "update_progress_callback": self.app.update_progress,
+            "update_global_progress_callback": self.app.update_global_progress,
+            "download_images": request.download_images,
+            "download_videos": request.download_videos,
+            "download_compressed": request.download_compressed,
+            "folder_structure": settings.get("folder_structure", "default"),
+            "rate_limit_interval": float(settings.get("rate_limit_interval", 0.0) or 0.0),
+            "tr": self.app.tr,
+            "max_workers": self.app.max_downloads,
+            "max_retries": int(settings.get("max_retries", 3) or 3),
+            "retry_interval": float(settings.get("retry_interval", 2.0) or 2.0),
             **extra,
-        )
+        }
         downloader = cls(**kwargs)
         downloader.file_naming_mode = settings.get("file_naming_mode", 0)
         self.app.active_downloader = downloader
@@ -291,11 +296,13 @@ class MainController:
     def _collect_file_stats(self, downloader) -> tuple[int, int]:
         failed = getattr(downloader, "failed_files", None)
         failed_count = len(failed) if hasattr(failed, "__len__") else 0
+        skipped = getattr(downloader, "skipped_files", None)
+        skipped_count = len(skipped) if hasattr(skipped, "__len__") else 0
 
         try:
-            completed_count = int(getattr(downloader, "completed_files", 0))
+            completed_count = int(getattr(downloader, "completed_files", 0)) + skipped_count
         except (TypeError, ValueError):
-            completed_count = 0
+            completed_count = skipped_count
 
         return failed_count, completed_count
 
@@ -460,14 +467,16 @@ class MainController:
             )
             if parsed.is_post:
                 self.app.add_log_message_safe(self.app.tr("POST_URL"))
-                method = dl.process_post_page
-            else:
-                self.app.add_log_message_safe(self.app.tr("PROFILE_URL"))
-                method = dl.process_profile_page
+                return DownloadJob(
+                    downloader=dl,
+                    method=dl.process_post_page,
+                    args=(request.url, request.download_folder, request.download_images, request.download_videos),
+                ), None
+            self.app.add_log_message_safe(self.app.tr("PROFILE_URL"))
             return DownloadJob(
                 downloader=dl,
-                method=method,
-                args=(request.url, request.download_folder, request.download_images, request.download_videos),
+                method=dl.process_profile_page,
+                args=(request.url, request.download_folder, request.download_images, request.download_videos, request.only_this_url),
             ), None
 
         message = self.app.tr("INVALID_URL")

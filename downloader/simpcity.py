@@ -1,6 +1,7 @@
 import os
 
 from downloader.core.base_api_downloader import BaseApiDownloader
+from downloader.adapters.http_retry import ScrapeCancelled
 from downloader.adapters.simpcity_adapter import SimpCityAdapter
 
 
@@ -53,7 +54,13 @@ class SimpCity(BaseApiDownloader):
     def download_images_from_simpcity(self, url, paginate=True):
         try:
             self.log("SIMPCITY_PROCESSING_THREAD", url=url)
-            resolved = self.adapter.resolve_thread(url, paginate=paginate)
+            resolved = self.adapter.resolve_thread(
+                url,
+                paginate=paginate,
+                download_images=self.download_images,
+                download_videos=self.download_videos,
+                download_attachments=self.download_compressed,
+            )
             target_folder = os.path.join(self.download_folder, resolved["folder_name"])
             os.makedirs(target_folder, exist_ok=True)
             self.run_batch(
@@ -62,6 +69,8 @@ class SimpCity(BaseApiDownloader):
                 "SIMPCITY_DOWNLOAD_CANCELLED",
             )
             self.log("SIMPCITY_DOWNLOAD_COMPLETED")
+        except ScrapeCancelled:
+            self.log("SIMPCITY_DOWNLOAD_CANCELLED")
         except Exception as e:
             self.log("SIMPCITY_ERROR_PROCESSING_THREAD", error=e)
         finally:

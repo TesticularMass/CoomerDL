@@ -21,10 +21,8 @@ class EromeDownloader(BaseApiDownloader):
         self.domain_name = "erome"
 
     def request_cancel(self):
-        self.cancel_requested.set()
+        super().request_cancel()
         self.log("EROME_DOWNLOAD_CANCELLED")
-        if self.is_profile_download and self.enable_widgets_callback:
-            self.enable_widgets_callback()
 
     def _download_entry(self, entry, root_folder):
         folder_name = entry.get("folder_name") or "erome_album"

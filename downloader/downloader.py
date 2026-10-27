@@ -60,12 +60,14 @@ class Downloader(BaseApiDownloader):
                     if self.cancel_requested.is_set():
                         return all_posts
 
-                    if specific_post_id and str(post.get("id")) == str(specific_post_id):
-                        return [post]
+                    if specific_post_id:
+                        if str(post.get("id")) == str(specific_post_id):
+                            return [post]
+                        continue
 
                     all_posts.append(post)
 
-                if specific_post_id or only_first_page:
+                if only_first_page:
                     return all_posts
 
                 if len(posts) < 50:
@@ -158,23 +160,15 @@ class Downloader(BaseApiDownloader):
         post_time=None,
         download_id=None,
     ):
-        request_url = media_url
-        response = self.safe_request(request_url, max_retries=self.max_retries)
-
-        if response is None:
-            fallback_url = self._pawchive_preview_fallback(media_url)
-            if fallback_url:
-                self.log("PAWCHIVE_PREVIEW_FALLBACK", media_url=media_url)
-                request_url = fallback_url
-
         self.process_media_element(
-            request_url,
+            media_url,
             user_id=user_id,
             post_id=post_id,
             post_name=post_name,
             post_time=post_time,
             download_id=download_id,
             record_url=media_url,
+            fallback_url=self._pawchive_preview_fallback(media_url),
         )
 
     def download_media(self, site, user_id, service, query=None, download_all=False, initial_offset=0, only_first_page=False):
