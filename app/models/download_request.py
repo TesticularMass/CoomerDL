@@ -7,4 +7,5 @@ class DownloadRequest:
     download_folder: str
     download_images: bool = True
     download_videos: bool = True
+    download_compressed: bool = True
     only_this_url: bool = False

@@ -47,7 +47,7 @@ class EromeAdapter(RetryingScraper):
     def clean_filename(filename):
         return re.sub(r'[<>:"/\\|?*]', "_", str(filename).split("?")[0])
 
-    def _resolve_profile(self, profile_url, soup=None, download_images=True, download_videos=True, direct_download=False):
+    def _resolve_profile(self, profile_url, soup=None, download_images=True, download_videos=True):
         soup = soup or self._request_soup(profile_url)
 
         username_tag = soup.find("h1", class_="username")
@@ -74,7 +74,6 @@ class EromeAdapter(RetryingScraper):
                     soup=None,
                     download_images=download_images,
                     download_videos=download_videos,
-                    direct_download=direct_download,
                     inherited_base_folder=base_folder_name,
                 )
                 media.extend(album_data["media"])
@@ -169,7 +168,6 @@ class EromeAdapter(RetryingScraper):
         soup=None,
         download_images=True,
         download_videos=True,
-        direct_download=False,
         inherited_base_folder=None,
     ):
         cached = None
@@ -193,9 +191,7 @@ class EromeAdapter(RetryingScraper):
         album_title = cached.get("album_title") or self.tr("EROME_UNKNOWN_ALBUM")
         album_folder_name = self.clean_filename(album_title)
 
-        if direct_download and inherited_base_folder:
-            effective_folder = inherited_base_folder
-        elif inherited_base_folder:
+        if inherited_base_folder:
             effective_folder = os.path.join(inherited_base_folder, album_folder_name)
         else:
             effective_folder = album_folder_name

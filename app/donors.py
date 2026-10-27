@@ -1,9 +1,10 @@
 import os
 import json
+import threading
 import requests
 
 from app.version import USER_AGENT
-from PySide6.QtCore import Qt, QObject, QThread, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -16,71 +17,17 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-
-# The donor list is maintained in https://github.com/Emy69/Proyect-C and
-# published as JSON, so the app reads it straight from the raw file.
 DONORS_URL = "https://raw.githubusercontent.com/Emy69/Proyect-C/main/donadores.json"
 
 
-class DonorsWorker(QObject):
-    finished = Signal(list)
-    error = Signal(str)
-
-    def run(self):
-        try:
-            response = requests.get(
-                DONORS_URL,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": USER_AGENT,
-                },
-                timeout=10,
-            )
-            response.raise_for_status()
-            self.finished.emit(self._parse_donors(response.json()))
-        except json.JSONDecodeError as exc:
-            # Must come first: requests' JSONDecodeError subclasses both
-            # json.JSONDecodeError and RequestException
-            self.error.emit(f"json:{exc}")
-        except requests.exceptions.RequestException as exc:
-            self.error.emit(f"request:{exc}")
-        except Exception as exc:
-            self.error.emit(f"unknown:{exc}")
-
-    @staticmethod
-    def _parse_donors(payload):
-        """
-        The published file is {"actualizado", "total", "donantes": [name, ...]}.
-        The previous source returned a plain list of objects, so both shapes
-        are accepted and normalised to the dicts the grid expects.
-        """
-        if isinstance(payload, dict):
-            entries = payload.get("donantes") or payload.get("donors") or []
-        elif isinstance(payload, list):
-            entries = payload
-        else:
-            entries = []
-
-        donors = []
-        for entry in entries:
-            if isinstance(entry, str):
-                name = entry.strip()
-                if name:
-                    donors.append({"name": name})
-            elif isinstance(entry, dict):
-                donors.append(entry)
-
-        return donors
-
-
 class DonorsModal(QDialog):
+    _donors_loaded = Signal(list)
+    _donors_failed = Signal(str)
+
     def __init__(self, parent, tr):
         super().__init__(parent)
         self.parent = parent
         self.tr = tr
-
-        self.worker_thread = None
-        self.worker = None
         self._donor_pixmaps = {}
 
         self.setWindowTitle(self.tr("DONORS_WINDOW_TITLE"))
@@ -88,16 +35,11 @@ class DonorsModal(QDialog):
         self.setFixedSize(600, 600)
         self.setWindowModality(Qt.WindowModal)
 
-        self.main_card = None
-        self.scroll_area = None
-        self.scroll_content = None
-        self.grid_layout = None
-        self.status_label = None
-        self.title_label = None
+        self._donors_loaded.connect(self._show_donors)
+        self._donors_failed.connect(self._show_error)
 
         self._build_ui()
-        self._center_window()
-        self._load_donors_async()
+        threading.Thread(target=self._fetch_donors, daemon=True).start()
 
     def _build_ui(self):
         self.setStyleSheet(
@@ -218,21 +160,29 @@ class DonorsModal(QDialog):
             "default": self._load_icon_pixmap("default.png"),
         }
 
-    def _load_donors_async(self):
-        self.worker_thread = QThread(self)
-        self.worker = DonorsWorker()
-        self.worker.moveToThread(self.worker_thread)
-
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self._show_donors)
-        self.worker.error.connect(self._show_error)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.error.connect(self.worker_thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker.error.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-
-        self.worker_thread.start()
+    def _fetch_donors(self):
+        try:
+            response = requests.get(
+                DONORS_URL,
+                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            entries = (payload.get("donantes") or payload.get("donors") or []) if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+            donors = []
+            for entry in entries:
+                if isinstance(entry, str) and entry.strip():
+                    donors.append({"name": entry.strip()})
+                elif isinstance(entry, dict):
+                    donors.append(entry)
+            self._donors_loaded.emit(donors)
+        except json.JSONDecodeError as exc:
+            self._donors_failed.emit(f"json:{exc}")
+        except requests.exceptions.RequestException as exc:
+            self._donors_failed.emit(f"request:{exc}")
+        except Exception as exc:
+            self._donors_failed.emit(f"unknown:{exc}")
 
     def _show_error(self, raw_error):
         self._clear_grid()
@@ -310,44 +260,6 @@ class DonorsModal(QDialog):
             row = (index // columns) + 1
             col = index % columns
             self.grid_layout.addWidget(card, row, col)
-
-    def _center_window(self):
-        if self.parent is not None:
-            parent_geometry = self.parent.frameGeometry()
-            dialog_geometry = self.frameGeometry()
-            dialog_geometry.moveCenter(parent_geometry.center())
-            self.move(dialog_geometry.topLeft())
-            return
-
-        screen = self.screen()
-        if screen is not None:
-            available = screen.availableGeometry()
-            dialog_geometry = self.frameGeometry()
-            dialog_geometry.moveCenter(available.center())
-            self.move(dialog_geometry.topLeft())
-
-    def _stop_worker_thread(self):
-        thread = self.worker_thread
-        if thread is None:
-            return
-        try:
-            if thread.isRunning():
-                thread.quit()
-                if not thread.wait(3000):
-                    thread.terminate()
-                    thread.wait(1000)
-        except RuntimeError:
-            # Thread C++ object already deleted
-            pass
-        self.worker_thread = None
-
-    def closeEvent(self, event):
-        self._stop_worker_thread()
-        super().closeEvent(event)
-
-    def reject(self):
-        self._stop_worker_thread()
-        super().reject()
 
     def show_modal(self):
         self.exec()

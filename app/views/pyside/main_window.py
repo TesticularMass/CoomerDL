@@ -2,18 +2,17 @@ import datetime
 from collections import deque
 import os
 import re
-import subprocess
-import sys
 import threading
 
 import time
 from typing import Optional
-from PySide6.QtCore import QObject, Signal, QTimer, Qt, QSize
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtCore import QObject, Signal, QTimer, Qt, QSize, QUrl
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
     QVBoxLayout,
+    QPlainTextEdit,
     QListWidgetItem,
     QMessageBox,
     QHBoxLayout,
@@ -22,7 +21,6 @@ from PySide6.QtWidgets import (
 
 from app.version import APP_VERSION
 from app.controllers.main_controller import MainController
-from app.models.app_state import AppState
 from app.models.profile_session import (
     DEFAULT_MAX_PROFILES_PER_SESSION,
     ProfileQueueItem,
@@ -33,14 +31,12 @@ from app.services.settings_service import SettingsService
 from app.services.translation_service import TranslationService
 from app.services.log_service import LogService
 from app.services.url_service import UrlService
-from app.adapters.downloader_factory import DownloaderFactory
 
 from app.views.pyside.widgets.download_panel import DownloadPanel, QueueItemRow
-from app.views.pyside.widgets.log_panel import LogPanel
+from app.views.pyside.progress.progress_item_widget import format_bytes
 from app.views.pyside.widgets.footer_bar import FooterBar
 from app.views.pyside.dialogs.settings_dialog import SettingsDialog
 from app.views.pyside.progress.progress_controller import ProgressController
-from app.adapters.pyside_frontend_bridge import PySideFrontendBridge
 from app.about_window import AboutWindow
 from app.donors import DonorsModal
 from app.views.pyside.dialogs.startup_community_dialog import StartupCommunityDialog
@@ -48,22 +44,6 @@ from app.views.pyside.dialogs.startup_community_dialog import StartupCommunityDi
 VERSION = f"V{APP_VERSION}"
 MAX_LOG_LINES = 500
 LOG_FLUSH_INTERVAL_MS = 150
-
-
-class QtLineEditAdapter:
-    def __init__(self, widget):
-        self.widget = widget
-
-    def get(self):
-        return self.widget.text()
-
-
-class QtCheckBoxAdapter:
-    def __init__(self, widget):
-        self.widget = widget
-
-    def get(self):
-        return self.widget.isChecked()
 
 
 class QtSignals(QObject):
@@ -91,18 +71,14 @@ class PySideMainWindow(QMainWindow):
         self.resize(1000, 700)
 
         # estado y servicios
-        self.app_state = AppState()
         self.settings_service = SettingsService()
-        self.app_state.language = self.settings_service.load_language_preference("en")
-        self.app_state.download_folder = self.settings_service.load_download_folder("downloads")
-        self.download_folder = self.app_state.download_folder
+        self.language = self.settings_service.load_language_preference("en")
+        self.download_folder = self.settings_service.load_download_folder("downloads")
 
-        self.translation_service = TranslationService(language=self.app_state.language)
+        self.translation_service = TranslationService(language=self.language)
         self.log_service = LogService()
         self.url_service = UrlService()
 
-        self.frontend_bridge = PySideFrontendBridge(self)
-        self.downloader_factory = DownloaderFactory(self.frontend_bridge, app=self)
         self.main_controller = MainController(self)
         self.progress_controller = ProgressController(self)
         # runtime
@@ -189,21 +165,14 @@ class PySideMainWindow(QMainWindow):
         self.download_panel = DownloadPanel(self, tr=self.tr)
         layout.addWidget(self.download_panel)
 
-        self.log_panel = LogPanel(self)
-        self.log_panel.log_text.setMaximumBlockCount(MAX_LOG_LINES)
-        layout.addWidget(self.log_panel, 1)
+        self.log_text = QPlainTextEdit(self)
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(MAX_LOG_LINES)
+        layout.addWidget(self.log_text, 1)
 
         self.footer_bar = FooterBar(self)
         self.footer_bar.progress_details_button.clicked.connect(self.toggle_progress_details)
         layout.addWidget(self.footer_bar)
-
-        self.url_entry = QtLineEditAdapter(self.download_panel.url_input)
-        self.download_images_check = QtCheckBoxAdapter(self.download_panel.images_check)
-        self.download_videos_check = QtCheckBoxAdapter(self.download_panel.videos_check)
-        self.download_compressed_check = QtCheckBoxAdapter(self.download_panel.compressed_check)
-        
-        self.only_this_url_check = QtCheckBoxAdapter(self.download_panel.only_this_url_check)
-        self.autoscroll_log_check = QtCheckBoxAdapter(self.download_panel.autoscroll_log_check)
 
         self.update_folder_label()
         
@@ -240,7 +209,7 @@ class PySideMainWindow(QMainWindow):
 
         dialog = StartupCommunityDialog(
             parent=self,
-            initial_language=self.app_state.language
+            initial_language=self.language
         )
 
         if dialog.exec():
@@ -252,12 +221,12 @@ class PySideMainWindow(QMainWindow):
         self.show()
 
     def load_translations(self, language=None):
-        target_language = language or self.app_state.language
-        self.app_state.language = target_language
+        target_language = language or self.language
+        self.language = target_language
         self.translation_service.set_language(target_language)
 
     def save_language_preference(self, language):
-        self.app_state.language = language
+        self.language = language
         self.settings_service.save_language_preference(language)
         self.translation_service.set_language(language)
 
@@ -340,8 +309,8 @@ class PySideMainWindow(QMainWindow):
         self.download_start_time = datetime.datetime.now()
         # Captured on the GUI thread; export_logs runs on the worker thread
         # and must not touch live widgets.
-        self._download_images_at_start = bool(self.download_images_check.get())
-        self._download_videos_at_start = bool(self.download_videos_check.get())
+        self._download_images_at_start = self.download_panel.images_check.isChecked()
+        self._download_videos_at_start = self.download_panel.videos_check.isChecked()
         self.log_service.clear_runtime()
         self.signals.set_download_enabled.emit(False)
         self.signals.set_cancel_enabled.emit(True)
@@ -526,35 +495,6 @@ class PySideMainWindow(QMainWindow):
         self.signals.global_progress.emit(int(completed_files), int(total_files))
 
     # ------------------------------------------------------------------
-    # downloader factory hooks
-    # ------------------------------------------------------------------
-    def setup_erome_downloader(self, is_profile_download=False):
-        self.erome_downloader = self.downloader_factory.create_erome_downloader(
-            is_profile_download=is_profile_download
-        )
-
-    def setup_simpcity_downloader(self):
-        self.simpcity_downloader = self.downloader_factory.create_simpcity_downloader()
-
-    def setup_bunkr_downloader(self):
-        self.bunkr_downloader = self.downloader_factory.create_bunkr_downloader()
-
-    def setup_general_downloader(self):
-        self.general_downloader = self.downloader_factory.create_general_downloader(self.settings)
-
-    def setup_jpg5_downloader(self):
-        self.active_downloader = self.downloader_factory.create_jpg5_downloader(
-            self.url_entry.get().strip()
-        )
-
-    def setup_coomerfans_downloader(self, is_profile_download=False):
-        self.coomerfans_downloader = self.downloader_factory.create_coomerfans_downloader(
-            is_profile_download=is_profile_download,
-            settings=self.settings,
-        )
-
-
-    # ------------------------------------------------------------------
     # acciones
     # ------------------------------------------------------------------
     def start_download(self):
@@ -571,7 +511,7 @@ class PySideMainWindow(QMainWindow):
             self.main_controller.start_download()
             return
 
-        if self.url_entry.get().strip():
+        if self.download_panel.url_input.text().strip():
             # A URL is sitting in the input: it only joins the session if
             # it fits the limit. Starting while silently dropping it is
             # not allowed, so on any rejection the session does not start.
@@ -645,7 +585,7 @@ class PySideMainWindow(QMainWindow):
         self._update_queue_visibility()
 
     def add_urls_to_list(self) -> bool:
-        raw_text = self.url_entry.get()
+        raw_text = self.download_panel.url_input.text()
         tokens = [token for token in re.split(r"\s+", raw_text.strip()) if token]
 
         if not tokens:
@@ -824,7 +764,6 @@ class PySideMainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, self.tr("SELECT_FOLDER"), self.download_folder or "")
         if folder:
             self.download_folder = folder
-            self.app_state.download_folder = folder
             self.settings_service.save_download_folder(folder)
             self.update_folder_label()
 
@@ -835,12 +774,7 @@ class PySideMainWindow(QMainWindow):
 
     def open_download_folder(self):
         if self.download_folder and os.path.exists(self.download_folder):
-            if sys.platform == "win32":
-                os.startfile(self.download_folder)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", self.download_folder])
-            else:
-                subprocess.Popen(["xdg-open", self.download_folder])
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.download_folder))
         else:
             self.show_error(self.tr("ERROR"), self.tr("INVALID_DOWNLOAD_FOLDER"))
 
@@ -858,13 +792,13 @@ class PySideMainWindow(QMainWindow):
             pending = list(self._pending_log_lines)[-MAX_LOG_LINES:]
             self._pending_log_lines.clear()
 
-        log_widget = self.log_panel.log_text
+        log_widget = self.log_text
         log_widget.setUpdatesEnabled(False)
         for line in pending:
             log_widget.appendHtml(line)
         log_widget.setUpdatesEnabled(True)
 
-        if bool(self.autoscroll_log_check.get()):
+        if self.download_panel.autoscroll_log_check.isChecked():
             scrollbar = log_widget.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
@@ -891,7 +825,7 @@ class PySideMainWindow(QMainWindow):
         self.footer_bar.progress_label.setText(f"{percentage}%")
 
     def _clear_logs(self):
-        self.log_panel.log_text.clear()
+        self.log_text.clear()
         self.footer_bar.progress_bar.setValue(0)
         self.footer_bar.progress_label.setText("0%")
         self.footer_set_speed("Speed: 0 KB/s")
@@ -911,21 +845,7 @@ class PySideMainWindow(QMainWindow):
         self.footer_bar.eta_label.setText(text)
 
     def _format_bytes(self, num_bytes):
-        try:
-            value = float(num_bytes or 0)
-        except Exception:
-            value = 0.0
+        return format_bytes(num_bytes)
 
-        units = ["B", "KB", "MB", "GB", "TB"]
-        idx = 0
-
-        while value >= 1024 and idx < len(units) - 1:
-            value /= 1024.0
-            idx += 1
-
-        if idx == 0:
-            return f"{int(value)} {units[idx]}"
-        return f"{value:.2f} {units[idx]}"
-    
     def footer_set_total_size(self, text: str):
         self.footer_bar.total_size_label.setText(text)

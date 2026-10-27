@@ -3,6 +3,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from app.models.download_request import DownloadRequest
+from app.version import USER_AGENT
+from downloader.bunkr import BunkrDownloader
+from downloader.coomerfans import CoomerfansDownloader
+from downloader.downloader import Downloader
+from downloader.erome import EromeDownloader
+from downloader.simpcity import SimpCity
 from app.models.profile_session import (
     ProfileQueueItem,
     ProfileSession,
@@ -67,17 +73,38 @@ class MainController:
         return url, None
 
     def build_request_from_ui(self) -> DownloadRequest:
-        url = self.normalize_profile_url(self.app.url_entry.get())
+        url = self.normalize_profile_url(self.app.download_panel.url_input.text())
         return self._build_request_for_url(url)
 
     def _build_request_for_url(self, url: str) -> DownloadRequest:
+        panel = self.app.download_panel
         return DownloadRequest(
             url=url,
             download_folder=self.app.download_folder,
-            download_images=bool(self.app.download_images_check.get()),
-            download_videos=bool(self.app.download_videos_check.get()),
-            only_this_url=bool(self.app.only_this_url_check.get()),
+            download_images=panel.images_check.isChecked(),
+            download_videos=panel.videos_check.isChecked(),
+            download_compressed=panel.compressed_check.isChecked(),
+            only_this_url=panel.only_this_url_check.isChecked(),
         )
+
+    def _create_downloader(self, cls, request: DownloadRequest, **extra):
+        settings = getattr(self.app, "settings", None) or {}
+        kwargs = dict(
+            download_folder=request.download_folder,
+            log_callback=self.app.add_log_message_safe,
+            enable_widgets_callback=self.app.enable_widgets,
+            update_progress_callback=self.app.update_progress,
+            update_global_progress_callback=self.app.update_global_progress,
+            tr=self.app.tr,
+            max_workers=self.app.max_downloads,
+            max_retries=int(settings.get("max_retries", 3) or 3),
+            retry_interval=float(settings.get("retry_interval", 2.0) or 2.0),
+            **extra,
+        )
+        downloader = cls(**kwargs)
+        downloader.file_naming_mode = settings.get("file_naming_mode", 0)
+        self.app.active_downloader = downloader
+        return downloader
 
     def start_download(self):
         self.start_session(None)
@@ -133,13 +160,6 @@ class MainController:
                 item.request = self._build_request_for_url(item.url)
 
         self.app.prepare_download_ui()
-
-        self.app.frontend_bridge.begin_session_snapshot(
-            download_folder=self.app.download_folder,
-            download_images=bool(self.app.download_images_check.get()),
-            download_videos=bool(self.app.download_videos_check.get()),
-            download_compressed=bool(self.app.download_compressed_check.get()),
-        )
 
         session = ProfileSession(items)
         self.current_session = session
@@ -256,7 +276,6 @@ class MainController:
                 )
 
             self.current_session = None
-            self.app.frontend_bridge.end_session_snapshot()
             self.app.set_session_active(False)
             self.app.enable_widgets()
             if any_job_started:
@@ -339,174 +358,121 @@ class MainController:
             self.app.add_log_message_safe(message)
             return None, JobResolutionError(message)
 
+        settings = getattr(self.app, "settings", None) or {}
+
         if parsed.site_type == "erome":
             self.app.add_log_message_safe(self.app.tr("DOWNLOADING_EROME"))
-            self.app.setup_erome_downloader(is_profile_download=parsed.is_profile)
-            self.app.active_downloader = self.app.erome_downloader
-
+            dl = self._create_downloader(
+                EromeDownloader,
+                request,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
+                    "Referer": "https://www.erome.com/",
+                },
+                download_images=request.download_images,
+                download_videos=request.download_videos,
+                is_profile_download=parsed.is_profile,
+            )
             if parsed.is_album:
                 self.app.add_log_message_safe(self.app.tr("ALBUM_URL"))
-                method = self.app.active_downloader.process_album_page
+                method = dl.process_album_page
             else:
                 self.app.add_log_message_safe("erome", self.app.tr("PROFILE_URL"))
-                method = self.app.active_downloader.process_profile_page
-
+                method = dl.process_profile_page
             return DownloadJob(
-                downloader=self.app.active_downloader,
+                downloader=dl,
                 method=method,
-                args=(
-                    request.url,
-                    request.download_folder,
-                    request.download_images,
-                    request.download_videos,
-                ),
+                args=(request.url, request.download_folder, request.download_images, request.download_videos),
             ), None
 
         if parsed.site_type == "bunkr":
             self.app.add_log_message_safe("bunkr", self.app.tr("DOWNLOADING_BUNKR"))
-            self.app.setup_bunkr_downloader()
-            self.app.active_downloader = self.app.bunkr_downloader
-
+            dl = self._create_downloader(
+                BunkrDownloader,
+                request,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                    "Referer": "https://bunkr.site/",
+                },
+            )
             if parsed.is_post:
                 self.app.add_log_message_safe(self.app.tr("POST_URL"))
-                method = self.app.bunkr_downloader.descargar_post_bunkr
+                method = dl.descargar_post_bunkr
             else:
                 self.app.add_log_message_safe("bunkr", self.app.tr("PROFILE_URL"))
-                method = self.app.bunkr_downloader.descargar_perfil_bunkr
-
-            return DownloadJob(
-                downloader=self.app.active_downloader,
-                method=method,
-                args=(request.url,),
-            ), None
+                method = dl.descargar_perfil_bunkr
+            return DownloadJob(downloader=dl, method=method, args=(request.url,)), None
 
         if parsed.site_type == "coomer_kemono":
             self.app.add_log_message_safe(self.app.tr("STARTING_DOWNLOAD"))
-            self.app.setup_general_downloader()
-            self.app.active_downloader = self.app.general_downloader
-
-            site = parsed.host
-            service = parsed.service
-            user = parsed.user
-            post = parsed.post
-
+            dl = self._create_downloader(
+                Downloader,
+                request,
+                headers={"User-Agent": USER_AGENT, "Referer": "https://pawchive.pw/"},
+                download_images=request.download_images,
+                download_videos=request.download_videos,
+                download_compressed=request.download_compressed,
+                folder_structure=settings.get("folder_structure", "default"),
+                rate_limit_interval=float(settings.get("rate_limit_interval", 0.0) or 0.0),
+            )
+            site, service, user, post = parsed.host, parsed.service, parsed.user, parsed.post
             if service is None or user is None:
-                if service is None:
-                    message = self.app.tr("FAILED_TO_EXTRACT_SERVICE")
-                else:
-                    message = self.app.tr("FAILED_TO_EXTRACT_USER_ID")
-
+                message = self.app.tr("FAILED_TO_EXTRACT_SERVICE" if service is None else "FAILED_TO_EXTRACT_USER_ID")
                 self.app.add_log_message_safe(message)
                 self.app.add_log_message_safe("SYSTEM", self.app.tr("INVALID_URL"))
                 return None, JobResolutionError(message)
 
-            self.app.add_log_message_safe(
-                self.app.tr(
-                    "EXTRACTED_SERVICE_SITE",
-                    service=service,
-                    site=site
-                )
-            )
-
+            self.app.add_log_message_safe(self.app.tr("EXTRACTED_SERVICE_SITE", service=service, site=site))
             if parsed.is_post:
                 self.app.add_log_message_safe(self.app.tr("DOWNLOADING_SINGLE_POST"))
-                return DownloadJob(
-                    downloader=self.app.active_downloader,
-                    method=self.start_ck_post_download,
-                    args=(
-                        self.app.active_downloader,
-                        site,
-                        service,
-                        user,
-                        post,
-                    ),
-                ), None
+                return DownloadJob(downloader=dl, method=dl.download_single_post, args=(site, post, service, user)), None
 
             self.app.add_log_message_safe(self.app.tr("DOWNLOADING_ALL_USER_CONTENT"))
             return DownloadJob(
-                downloader=self.app.active_downloader,
-                method=self.start_ck_profile_download,
-                args=(
-                    self.app.active_downloader,
-                    site,
-                    service,
-                    user,
-                    parsed.query,
-                    True,
-                    parsed.offset,
-                    request.only_this_url,
-                ),
+                downloader=dl,
+                method=dl.download_media,
+                args=(site, user, service, parsed.query, True, parsed.offset, request.only_this_url),
             ), None
 
         if parsed.site_type == "simpcity":
             self.app.add_log_message_safe(self.app.tr("DOWNLOADING_SIMPCITY"))
-            self.app.setup_simpcity_downloader()
-            self.app.active_downloader = self.app.simpcity_downloader
+            dl = self._create_downloader(SimpCity, request)
             return DownloadJob(
-                downloader=self.app.active_downloader,
-                method=self.app.active_downloader.download_images_from_simpcity,
+                downloader=dl,
+                method=dl.download_images_from_simpcity,
                 args=(request.url, not request.only_this_url),
-            ), None
-
-        if parsed.site_type == "jpg5":
-            self.app.add_log_message_safe(self.app.tr("DOWNLOADING_FROM_JPG5"))
-            self.app.setup_jpg5_downloader()
-            return DownloadJob(
-                downloader=self.app.active_downloader,
-                method=self.app.active_downloader.descargar_imagenes,
-                args=(),
             ), None
 
         if parsed.site_type == "coomerfans":
             self.app.add_log_message_safe(self.app.tr("DOWNLOADING_COOMERFANS"))
-            self.app.setup_coomerfans_downloader(is_profile_download=parsed.is_profile)
-            self.app.active_downloader = self.app.coomerfans_downloader
-
+            dl = self._create_downloader(
+                CoomerfansDownloader,
+                request,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+                    "Referer": "https://coomerfans.com/",
+                },
+                download_images=request.download_images,
+                download_videos=request.download_videos,
+                is_profile_download=parsed.is_profile,
+                folder_structure=settings.get("folder_structure", "default"),
+                rate_limit_interval=float(settings.get("rate_limit_interval", 0.0) or 0.0),
+            )
             if parsed.is_post:
                 self.app.add_log_message_safe(self.app.tr("POST_URL"))
-                method = self.app.active_downloader.process_post_page
+                method = dl.process_post_page
             else:
                 self.app.add_log_message_safe(self.app.tr("PROFILE_URL"))
-                method = self.app.active_downloader.process_profile_page
-
+                method = dl.process_profile_page
             return DownloadJob(
-                downloader=self.app.active_downloader,
+                downloader=dl,
                 method=method,
-                args=(
-                    request.url,
-                    request.download_folder,
-                    request.download_images,
-                    request.download_videos,
-                ),
+                args=(request.url, request.download_folder, request.download_images, request.download_videos),
             ), None
 
         message = self.app.tr("INVALID_URL")
         self.app.add_log_message_safe(message)
         return None, JobResolutionError(message, show_popup=False)
-
-    def start_ck_profile_download(self, downloader, site, service, user, query, download_all, initial_offset, only_this_url=False):
-        download_info = downloader.download_media(
-            site,
-            user,
-            service,
-            query=query,
-            download_all=download_all,
-            initial_offset=initial_offset,
-            only_first_page=only_this_url,
-        )
-        if download_info:
-            self.app.add_log_message_safe(
-                self.app.tr("DOWNLOAD_INFO", download_info=download_info)
-            )
-        return download_info
-
-    def start_ck_post_download(self, downloader, site, service, user, post):
-        download_info = downloader.download_single_post(site, post, service, user)
-        if download_info:
-            self.app.add_log_message_safe(
-                self.app.tr("DOWNLOAD_INFO", download_info=download_info)
-            )
-        return download_info
 
     def request_session_cancel(self):
         session = self.current_session

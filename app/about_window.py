@@ -1,9 +1,10 @@
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal, QUrl, QByteArray, QSize
+from PySide6.QtCore import Qt, Signal, QUrl, QByteArray, QSize, QRectF
 from PySide6.QtGui import QPixmap, QImage, QIcon, QDesktopServices, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QDialog,
@@ -16,125 +17,19 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-
-class ContributorsWorker(QObject):
-    """Fetches the contributors list AND their avatar bytes in one shot."""
-
-    finished = Signal(list)
-    error = Signal(str)
-
-    HEADERS = {"User-Agent": "CoomerDL-About"}
-
-    def run(self):
-        try:
-            response = requests.get(
-                "https://api.github.com/repos/Emy69/CoomerDL/contributors",
-                headers={**self.HEADERS, "Accept": "application/vnd.github+json"},
-                params={"per_page": 100},
-                timeout=15,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            contributors = []
-            if isinstance(data, list):
-                for c in data:
-                    if c.get("type") == "Bot":
-                        continue
-                    login = c.get("login") or ""
-                    if login.lower() == "emy69":
-                        continue
-                    contributors.append(
-                        {
-                            "login": login,
-                            "avatar_url": c.get("avatar_url") or "",
-                            "html_url": c.get("html_url") or f"https://github.com/{login}",
-                            "contributions": int(c.get("contributions") or 0),
-                            "avatar_bytes": None,
-                        }
-                    )
-
-            # Download avatars in parallel
-            def fetch_avatar(item):
-                url = item["avatar_url"]
-                if not url:
-                    return item
-                try:
-                    r = requests.get(url, headers=self.HEADERS, timeout=15)
-                    r.raise_for_status()
-                    item["avatar_bytes"] = bytes(r.content)
-                except Exception:
-                    item["avatar_bytes"] = None
-                return item
-
-            if contributors:
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    contributors = list(pool.map(fetch_avatar, contributors))
-
-            self.finished.emit(contributors)
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-
-class GitHubDataWorker(QObject):
-    finished = Signal(str, int, int, object)
-
-    def __init__(self):
-        super().__init__()
-
-    def run(self):
-        url = "https://api.github.com/repos/Emy69/CoomerDL"
-        avatar_bytes = None
-        try:
-            response = requests.get(url, timeout=15)
-            response.raise_for_status()
-            repo_data = response.json()
-
-            created_at = repo_data.get("created_at", "N/A")
-            created_date = created_at.split("T")[0] if created_at != "N/A" else "N/A"
-            stars = int(repo_data.get("stargazers_count", 0))
-
-            releases_url = repo_data.get("releases_url", "").replace("{/id}", "")
-            total_downloads = 0
-
-            if releases_url:
-                releases_response = requests.get(releases_url, timeout=15)
-                releases_response.raise_for_status()
-                releases_data = releases_response.json()
-
-                if releases_data:
-                    total_downloads = sum(
-                        asset.get("download_count", 0)
-                        for release in releases_data
-                        for asset in release.get("assets", [])
-                    )
-
-            try:
-                av = requests.get(
-                    "https://github.com/Emy69.png",
-                    headers={"User-Agent": "CoomerDL-About"},
-                    timeout=15,
-                )
-                av.raise_for_status()
-                avatar_bytes = bytes(av.content)
-            except Exception:
-                avatar_bytes = None
-
-            self.finished.emit(created_date, total_downloads, stars, avatar_bytes)
-        except Exception as e:
-            print(f"Error fetching GitHub data: {e}")
-            self.finished.emit("N/A", 0, 0, avatar_bytes)
+ABOUT_HEADERS = {"User-Agent": "CoomerDL-About"}
 
 
 class AboutWindow(QDialog):
+    _github_loaded = Signal(str, int, int, object)
+    _contributors_loaded = Signal(list)
+    _contributors_failed = Signal(str)
+
     def __init__(self, parent, translate, version):
         super().__init__(parent)
         self.parent = parent
         self.translate = translate
         self.version = version
-
-        self.worker_thread = None
-        self.worker = None
 
         self.setWindowTitle(self.translate("ABOUT_WINDOW_TITLE"))
         self.setModal(True)
@@ -146,26 +41,16 @@ class AboutWindow(QDialog):
         self.downloads_label = None
         self.date_label = None
         self.stars_button = None
-
-        self.discord_button = None
-        self.patron_button = None
-        self.x_button = None
-        self.footer_label = None
-        self.community_label = None
-        self.title_label = None
         self.dev_icon_label = None
-
-        self.contributors_label = None
-        self.contributors_strip = None
         self.contributors_strip_layout = None
-        self.contributors_status_label = None
-        self.contributors_worker_thread = None
-        self.contributors_worker = None
+
+        self._github_loaded.connect(self._update_github_labels)
+        self._contributors_loaded.connect(self._render_contributors)
+        self._contributors_failed.connect(self._render_contributors_error)
 
         self._build_ui()
-        self._center_window()
-        self._load_github_data_async()
-        self._load_contributors_async()
+        threading.Thread(target=self._fetch_github_data, daemon=True).start()
+        threading.Thread(target=self._fetch_contributors, daemon=True).start()
 
     def _build_ui(self):
         self.setStyleSheet(
@@ -429,53 +314,83 @@ class AboutWindow(QDialog):
     def _open_url(self, url: str):
         QDesktopServices.openUrl(QUrl(url))
 
-    def _load_github_data_async(self):
-        self.worker_thread = QThread(self)
-        self.worker = GitHubDataWorker()
-        self.worker.moveToThread(self.worker_thread)
+    def _fetch_github_data(self):
+        avatar_bytes = None
+        try:
+            repo_data = requests.get("https://api.github.com/repos/Emy69/CoomerDL", timeout=15).json()
+            created_at = repo_data.get("created_at", "N/A")
+            created_date = created_at.split("T")[0] if created_at != "N/A" else "N/A"
+            stars = int(repo_data.get("stargazers_count", 0))
+            releases_url = repo_data.get("releases_url", "").replace("{/id}", "")
+            total_downloads = 0
+            if releases_url:
+                releases_data = requests.get(releases_url, timeout=15).json() or []
+                total_downloads = sum(
+                    asset.get("download_count", 0)
+                    for release in releases_data
+                    for asset in release.get("assets", [])
+                )
+            try:
+                av = requests.get("https://github.com/Emy69.png", headers=ABOUT_HEADERS, timeout=15)
+                av.raise_for_status()
+                avatar_bytes = bytes(av.content)
+            except Exception:
+                pass
+            self._github_loaded.emit(created_date, total_downloads, stars, avatar_bytes)
+        except Exception:
+            self._github_loaded.emit("N/A", 0, 0, avatar_bytes)
 
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self._update_github_labels)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+    def _fetch_contributors(self):
+        try:
+            response = requests.get(
+                "https://api.github.com/repos/Emy69/CoomerDL/contributors",
+                headers={**ABOUT_HEADERS, "Accept": "application/vnd.github+json"},
+                params={"per_page": 100},
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            contributors = [
+                {
+                    "login": c.get("login") or "",
+                    "avatar_url": c.get("avatar_url") or "",
+                    "html_url": c.get("html_url") or f"https://github.com/{c.get('login') or ''}",
+                    "contributions": int(c.get("contributions") or 0),
+                    "avatar_bytes": None,
+                }
+                for c in (data if isinstance(data, list) else [])
+                if c.get("type") != "Bot" and (c.get("login") or "").lower() != "emy69"
+            ]
 
-        self.worker_thread.start()
+            def fetch_avatar(item):
+                url = item["avatar_url"]
+                if url:
+                    try:
+                        r = requests.get(url, headers=ABOUT_HEADERS, timeout=15)
+                        r.raise_for_status()
+                        item["avatar_bytes"] = bytes(r.content)
+                    except Exception:
+                        pass
+                return item
+
+            if contributors:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    contributors = list(pool.map(fetch_avatar, contributors))
+            self._contributors_loaded.emit(contributors)
+        except Exception as exc:
+            self._contributors_failed.emit(str(exc))
 
     def _update_github_labels(self, created_date: str, total_downloads: int, stars: int, avatar_bytes):
         if self.date_label is not None:
-            self.date_label.setText(
-                f"{self.translate('RELEASE_DATE_LABEL')}: {created_date}"
-            )
-
+            self.date_label.setText(f"{self.translate('RELEASE_DATE_LABEL')}: {created_date}")
         if self.downloads_label is not None:
-            self.downloads_label.setText(
-                f"{self.translate('TOTAL_DOWNLOADS_LABEL')}: {total_downloads:,}"
-            )
-
+            self.downloads_label.setText(f"{self.translate('TOTAL_DOWNLOADS_LABEL')}: {total_downloads:,}")
         if self.stars_button is not None:
             self.stars_button.setText(f"★ {stars:,}")
-
         if avatar_bytes and self.dev_icon_label is not None:
             pixmap = self._build_circular_avatar(avatar_bytes, size=20)
             if pixmap is not None:
                 self.dev_icon_label.setPixmap(pixmap)
-
-    def _load_contributors_async(self):
-        self.contributors_worker_thread = QThread(self)
-        self.contributors_worker = ContributorsWorker()
-        self.contributors_worker.moveToThread(self.contributors_worker_thread)
-
-        self.contributors_worker_thread.started.connect(self.contributors_worker.run)
-        self.contributors_worker.finished.connect(self._render_contributors)
-        self.contributors_worker.error.connect(self._render_contributors_error)
-        self.contributors_worker.finished.connect(self.contributors_worker_thread.quit)
-        self.contributors_worker.error.connect(self.contributors_worker_thread.quit)
-        self.contributors_worker.finished.connect(self.contributors_worker.deleteLater)
-        self.contributors_worker.error.connect(self.contributors_worker.deleteLater)
-        self.contributors_worker_thread.finished.connect(self.contributors_worker_thread.deleteLater)
-
-        self.contributors_worker_thread.start()
 
     def _clear_contributors_strip(self):
         if self.contributors_strip_layout is None:
@@ -548,8 +463,6 @@ class AboutWindow(QDialog):
 
     @staticmethod
     def _build_circular_avatar(data, size=48):
-        from PySide6.QtCore import QRectF
-
         if not data:
             return None
 
@@ -579,47 +492,6 @@ class AboutWindow(QDialog):
         painter.end()
 
         return rounded
-
-    def _center_window(self):
-        if self.parent is not None:
-            parent_geometry = self.parent.frameGeometry()
-            dialog_geometry = self.frameGeometry()
-            dialog_geometry.moveCenter(parent_geometry.center())
-            self.move(dialog_geometry.topLeft())
-            return
-
-        screen = self.screen()
-        if screen is not None:
-            available = screen.availableGeometry()
-            dialog_geometry = self.frameGeometry()
-            dialog_geometry.moveCenter(available.center())
-            self.move(dialog_geometry.topLeft())
-
-    def _stop_thread(self, thread):
-        if thread is None:
-            return
-        try:
-            if thread.isRunning():
-                thread.quit()
-                if not thread.wait(3000):
-                    thread.terminate()
-                    thread.wait(1000)
-        except RuntimeError:
-            pass
-
-    def _stop_all_workers(self):
-        self._stop_thread(self.worker_thread)
-        self._stop_thread(self.contributors_worker_thread)
-        self.worker_thread = None
-        self.contributors_worker_thread = None
-
-    def closeEvent(self, event):
-        self._stop_all_workers()
-        super().closeEvent(event)
-
-    def reject(self):
-        self._stop_all_workers()
-        super().reject()
 
     def show_about(self):
         self.exec()

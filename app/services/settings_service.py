@@ -3,6 +3,15 @@ import os
 
 
 class SettingsService:
+    DEFAULT_SETTINGS = {
+        "max_downloads": 3,
+        "folder_structure": "default",
+        "language": "en",
+        "max_retries": 3,
+        "retry_interval": 2.0,
+        "file_naming_mode": 0,
+    }
+
     def __init__(self, settings_path="resources/config/settings.json"):
         self.settings_path = settings_path
 
@@ -16,9 +25,11 @@ class SettingsService:
         try:
             with open(self.settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data if isinstance(data, dict) else {}
+                if isinstance(data, dict):
+                    return {**self.DEFAULT_SETTINGS, **data}
         except Exception:
-            return {}
+            pass
+        return dict(self.DEFAULT_SETTINGS)
 
     def save_settings(self, data: dict):
         os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
@@ -26,8 +37,7 @@ class SettingsService:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
     def get(self, key, default=None):
-        settings = self.load_settings()
-        return settings.get(key, default)
+        return self.load_settings().get(key, default)
 
     def set(self, key, value):
         settings = self.load_settings()

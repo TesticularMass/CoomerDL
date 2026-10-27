@@ -1,5 +1,5 @@
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 from urllib.parse import parse_qsl, urlparse
 import os
@@ -72,8 +72,6 @@ class BaseApiDownloader:
         self.file_lock = threading.Lock()
         self.counter_lock = threading.Lock()
         self.post_attachment_counter = defaultdict(int)
-        self.subdomain_cache = {}
-        self.subdomain_locks = defaultdict(threading.Lock)
         self.request_timeout = (10, 120)
         # Query parameters that carry the original filename (bunkr uses n).
         self.filename_query_keys = ("n",)
@@ -103,20 +101,8 @@ class BaseApiDownloader:
             try:
                 return self.tr(key, **kwargs)
             except TypeError:
-                text = self.tr(key)
-                if kwargs:
-                    try:
-                        return text.format(**kwargs)
-                    except Exception:
-                        return text
-                return text
-
-        if kwargs:
-            try:
-                return key.format(**kwargs)
-            except Exception:
-                return key
-        return key
+                key = self.tr(key)
+        return key.format(**kwargs) if kwargs else key
 
     def init_db(self):
         self.db_connection = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -156,6 +142,17 @@ class BaseApiDownloader:
         self.log("DOWNLOAD_CANCELLATION_REQUESTED")
         for future in self.futures:
             future.cancel()
+
+    def run_batch(self, items, worker_fn, cancel_log_key=None):
+        self.total_files = len(items)
+        self.completed_files = 0
+        self.futures = [self.executor.submit(worker_fn, item) for item in items]
+        for future in as_completed(self.futures):
+            if self.cancel_requested.is_set():
+                if cancel_log_key:
+                    self.log(cancel_log_key)
+                break
+            future.result()
 
     def shutdown_executor(self):
         if not self.shutdown_called:
@@ -327,35 +324,6 @@ class BaseApiDownloader:
                     response = self.session.get(url, stream=True, headers=headers, timeout=self.request_timeout)
                     sc = response.status_code
 
-                    if sc in (403, 404) and ("coomer" in domain or "kemono" in domain):
-                        if self.update_progress_callback:
-                            self.update_progress_callback(0, 0, status=f"{sc} - probing subdomains")
-
-                        with self.subdomain_locks[path]:
-                            if path in self.subdomain_cache:
-                                alt_url = self.subdomain_cache[path]
-                            else:
-                                alt_url = self._find_valid_subdomain(url)
-                                self.subdomain_cache[path] = alt_url
-
-                        if alt_url != url:
-                            found = urlparse(alt_url).netloc
-                            if self.update_progress_callback:
-                                self.update_progress_callback(0, 0, status=f"Subdomain found: {found}")
-
-                            alt_domain = urlparse(alt_url).netloc
-                            if not self._wait_for_domain_cooldown(alt_domain):
-                                return None
-
-                            response = self.session.get(alt_url, stream=True, headers=headers, timeout=self.request_timeout)
-                            response.raise_for_status()
-                            self._mark_domain_success(alt_domain)
-                            return response
-
-                        if self.update_progress_callback:
-                            self.update_progress_callback(0, 0, status="Exhausted subdomains")
-                        return None
-
                     response.raise_for_status()
                     self._mark_domain_success(domain)
                     return response
@@ -370,7 +338,6 @@ class BaseApiDownloader:
 
                     # A 403/404 means the URL itself is wrong or expired, so
                     # repeating the same request cannot help. Coomer/kemono
-                    # are handled by the subdomain probe above.
                     give_up = is_last_attempt or status_code in (403, 404)
 
                     if give_up:
@@ -416,40 +383,6 @@ class BaseApiDownloader:
                     time.sleep(retry_delay)
 
         return None
-
-    def _find_valid_subdomain(self, url, max_subdomains=10):
-        parsed = urlparse(url)
-        original_path = parsed.path
-
-        path = original_path
-        if not original_path.startswith("/data/"):
-            path = ("/data" + original_path) if not original_path.startswith("/data") else original_path
-
-        host = parsed.netloc
-
-        if "coomer" in host:
-            base_domains = ["coomer.st"]
-        elif "kemono" in host:
-            base_domains = ["kemono.cr", "kemono.su"]
-        else:
-            base_domains = [host]
-
-        for base in base_domains:
-            for i in range(1, max_subdomains + 1):
-                domain = f"n{i}.{base}"
-                test_url = parsed._replace(netloc=domain, path=path).geturl()
-
-                if self.update_progress_callback:
-                    self.update_progress_callback(0, 0, status=f"Testing subdomain: {domain}")
-
-                try:
-                    resp = self.session.get(test_url, headers=self.headers, timeout=self.request_timeout, stream=True)
-                    if resp.status_code == 200:
-                        return test_url
-                except Exception:
-                    pass
-
-        return url
 
     def process_media_element(
         self,

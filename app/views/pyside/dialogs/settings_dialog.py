@@ -1,3 +1,5 @@
+import os
+import json
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -20,14 +22,95 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
 
+import shutil
+import sqlite3
 from app.models.profile_session import DEFAULT_MAX_PROFILES_PER_SESSION
-from app.services.settings_window_service import SettingsWindowService
-from app.services.download_settings_service import DownloadSettingsService
-from app.services.cookies_settings_service import CookiesSettingsService
-from app.services.database_settings_service import DatabaseSettingsService
+from app.services.settings_service import SettingsService
+from app.views.pyside.progress.progress_item_widget import format_bytes
 
 
 class SettingsDialog(QDialog):
+    NAMING_MODE_LABEL_TO_VALUE = {
+        "Use File ID (default)": 0,
+        "Use Sanitized Post Name": 1,
+        "Post Name + Post ID Suffix": 2,
+        "Post Date/Time + Post Name": 3,
+    }
+
+    NAMING_MODE_VALUE_TO_LABEL = {v: k for k, v in NAMING_MODE_LABEL_TO_VALUE.items()}
+
+    def _save_settings_file(self, settings: dict):
+        self.settings_service.save_settings(settings)
+        if callable(self.on_settings_changed):
+            self.on_settings_changed(settings)
+
+    def _get_language_name(self, languages: dict, lang_code: str):
+        for name, code in languages.items():
+            if code == lang_code:
+                return name
+        return "English"
+
+    def _get_naming_label_from_setting(self, value):
+        if isinstance(value, int):
+            return self.NAMING_MODE_VALUE_TO_LABEL.get(value, self.NAMING_MODE_VALUE_TO_LABEL[0])
+        if isinstance(value, str):
+            if value in self.NAMING_MODE_LABEL_TO_VALUE:
+                return value
+            try:
+                numeric = int(value)
+                return self.NAMING_MODE_VALUE_TO_LABEL.get(numeric, self.NAMING_MODE_VALUE_TO_LABEL[0])
+            except Exception:
+                return self.NAMING_MODE_VALUE_TO_LABEL[0]
+        return self.NAMING_MODE_VALUE_TO_LABEL[0]
+
+    def _load_cookies_text(self) -> str:
+        if not os.path.exists(self.COOKIES_PATH):
+            return ""
+        try:
+            with open(self.COOKIES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, (dict, list)):
+                    return json.dumps(data, indent=4, ensure_ascii=False)
+                return ""
+        except Exception:
+            try:
+                with open(self.COOKIES_PATH, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                return ""
+
+    def _save_cookies_text(self, cookies_text: str):
+        cookies_text = cookies_text.strip()
+        cookies_data = json.loads(cookies_text) if cookies_text else None
+        os.makedirs(os.path.dirname(self.COOKIES_PATH), exist_ok=True)
+        with open(self.COOKIES_PATH, "w", encoding="utf-8") as f:
+            json.dump(cookies_data, f, indent=4, ensure_ascii=False)
+        return cookies_data
+
+    def _count_cookies(self) -> int:
+        if not os.path.exists(self.COOKIES_PATH):
+            return 0
+        try:
+            with open(self.COOKIES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, (dict, list)):
+                return len(data)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _get_file_type(file_path: str) -> str:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"]:
+            return "Image"
+        if ext in [".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".wmv", ".m4v"]:
+            return "Video"
+        if ext in [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"]:
+            return "Document"
+        if ext in [".zip", ".rar", ".7z", ".tar", ".gz"]:
+            return "Compressed"
+        return "Other"
     def __init__(
         self,
         parent,
@@ -55,31 +138,13 @@ class SettingsDialog(QDialog):
 
         self.languages = self._load_languages_map()
 
-        self.settings_service = SettingsWindowService(
-            config_path=self.CONFIG_PATH,
-            on_settings_changed=on_settings_changed
-        )
-        self.download_settings_service = DownloadSettingsService()
-        self.cookies_settings_service = CookiesSettingsService(self.COOKIES_PATH)
-        self.database_settings_service = DatabaseSettingsService()
+        self.settings_service = SettingsService(self.CONFIG_PATH)
         self.settings = self.settings_service.load_settings()
 
-        self.setWindowTitle(self._t("SETTINGS_WINDOW_TITLE", version=self.version))
+        self.setWindowTitle(self.translate("SETTINGS_WINDOW_TITLE", version=self.version))
         self.resize(920, 680)
 
         self._build_ui()
-
-    def _t(self, key, **kwargs):
-        try:
-            return self.translate(key, **kwargs)
-        except TypeError:
-            text = self.translate(key)
-            if kwargs:
-                try:
-                    return text.format(**kwargs)
-                except Exception:
-                    return text
-            return text
 
     def _load_languages_map(self):
         available = []
@@ -135,7 +200,7 @@ class SettingsDialog(QDialog):
         self.language_combo = QComboBox()
         self.language_combo.addItems(list(self.languages.keys()))
         self.language_combo.setCurrentText(
-            self.settings_service.get_language_name(
+            self._get_language_name(
                 self.languages,
                 self.settings.get("language", "en")
             )
@@ -182,9 +247,9 @@ class SettingsDialog(QDialog):
         layout.addRow(self.retry_interval_label, self.retry_interval_edit)
 
         self.file_naming_combo = QComboBox()
-        naming_options = self.download_settings_service.get_naming_options()
+        naming_options = list(self.NAMING_MODE_LABEL_TO_VALUE.keys())
         self.file_naming_combo.addItems(naming_options)
-        current_naming_label = self.download_settings_service.get_naming_label_from_setting(
+        current_naming_label = self._get_naming_label_from_setting(
             self.settings.get("file_naming_mode", 0)
         )
         self.file_naming_combo.setCurrentText(current_naming_label)
@@ -228,7 +293,7 @@ class SettingsDialog(QDialog):
         self.cookies_text = QTextEdit()
         self.cookies_text.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.cookies_text.setPlaceholderText('{\n    "cookie_name": "cookie_value"\n}')
-        self.cookies_text.setPlainText(self.cookies_settings_service.load_cookies_text())
+        self.cookies_text.setPlainText(self._load_cookies_text())
         layout.addWidget(self.cookies_text, 1)
 
         buttons_row = QHBoxLayout()
@@ -261,10 +326,10 @@ class SettingsDialog(QDialog):
         self._update_cookies_status()
 
     def _update_cookies_status(self):
-        count = self.cookies_settings_service.count_cookies()
+        count = self._count_cookies()
         if count > 0:
             self.cookies_status_label.setText(
-                self._t("SETTINGS_COOKIES_STATUS_COUNT", count=count)
+                self.translate("SETTINGS_COOKIES_STATUS_COUNT", count=count)
             )
         else:
             self.cookies_status_label.setText(self.translate("SETTINGS_COOKIES_STATUS_EMPTY"))
@@ -349,7 +414,7 @@ class SettingsDialog(QDialog):
         self.language_combo.clear()
         self.language_combo.addItems(list(self.languages.keys()))
         self.language_combo.setCurrentText(
-            self.settings_service.get_language_name(self.languages, current_language_code)
+            self._get_language_name(self.languages, current_language_code)
         )
         self.language_combo.blockSignals(False)
 
@@ -359,17 +424,17 @@ class SettingsDialog(QDialog):
         self.file_naming_combo.blockSignals(True)
         self.file_naming_combo.clear()
 
-        naming_options = self.download_settings_service.get_naming_options()
+        naming_options = list(self.NAMING_MODE_LABEL_TO_VALUE.keys())
         self.file_naming_combo.addItems(naming_options)
 
-        current_naming_label = self.download_settings_service.get_naming_label_from_setting(
+        current_naming_label = self._get_naming_label_from_setting(
             current_mode_value
         )
         self.file_naming_combo.setCurrentText(current_naming_label)
         self.file_naming_combo.blockSignals(False)
 
     def _reload_cookies_text(self):
-        self.cookies_text.setPlainText(self.cookies_settings_service.load_cookies_text())
+        self.cookies_text.setPlainText(self._load_cookies_text())
 
     # ------------------------------------------------------------
     # Database
@@ -393,32 +458,63 @@ class SettingsDialog(QDialog):
             self.db_summary_label.setText(self.translate("SETTINGS_DB_EMPTY"))
             return
 
-        summary = self.database_settings_service.build_summary(rows)
+        users = {rec[4] for rec in rows}
+        total_size = sum(rec[3] or 0 for rec in rows)
         self.db_summary_label.setText(
-            self._t(
+            self.translate(
                 "SETTINGS_DB_SUMMARY",
-                users=summary["users"],
-                files=summary["files"],
-                size=summary["size_str"],
+                users=len(users),
+                files=len(rows),
+                size=format_bytes(total_size),
             )
         )
 
     def load_db_records(self):
         db_path = self._get_db_path()
 
-        if not self.database_settings_service.database_exists(db_path):
+        if not (db_path and os.path.exists(db_path)):
             self.db_tree.clear()
             self._update_db_summary([])
             return
 
         try:
-            rows = self.database_settings_service.fetch_download_rows(db_path)
-            payload = self.database_settings_service.build_tree_payload(rows)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, media_url, file_path, file_size, user_id, post_id, downloaded_at "
+                "FROM downloads ORDER BY user_id, post_id, id"
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            usuarios = {}
+            for rec in rows:
+                rec_id, media_url, file_path, file_size, user_id, post_id, downloaded_at = rec
+                usuarios.setdefault(user_id, []).append(rec)
+
+            payload = []
+            for user, registros in usuarios.items():
+                user_entry = {"user": user, "posts": {}, "no_post": []}
+                for rec in registros:
+                    rec_id, media_url, file_path, file_size, user_id, post_id, downloaded_at = rec
+                    item = {
+                        "id": rec_id,
+                        "file_name": os.path.basename(file_path) if file_path else "",
+                        "file_type": self._get_file_type(file_path or ""),
+                        "size_str": format_bytes(file_size),
+                        "downloaded_at": downloaded_at,
+                    }
+                    if post_id:
+                        user_entry["posts"].setdefault(post_id, []).append(item)
+                    else:
+                        user_entry["no_post"].append(item)
+                payload.append(user_entry)
+
         except Exception as e:
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_LOADING_DATABASE", error=e)
+                self.translate("SETTINGS_ERROR_LOADING_DATABASE", error=e)
             )
             return
 
@@ -496,7 +592,7 @@ class SettingsDialog(QDialog):
     def _export_db(self):
         db_path = self._get_db_path()
 
-        if not self.database_settings_service.database_exists(db_path):
+        if not (db_path and os.path.exists(db_path)):
             QMessageBox.warning(
                 self,
                 self.translate("WARNING"),
@@ -514,7 +610,7 @@ class SettingsDialog(QDialog):
             return
 
         try:
-            self.database_settings_service.export_database(db_path, export_path)
+            shutil.copy(db_path, export_path)
             QMessageBox.information(
                 self,
                 self.translate("SUCCESS"),
@@ -524,12 +620,12 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_EXPORTING_DATABASE", error=e)
+                self.translate("SETTINGS_ERROR_EXPORTING_DATABASE", error=e)
             )
 
     def _delete_selected_users(self):
         db_path = self._get_db_path()
-        if not self.database_settings_service.database_exists(db_path):
+        if not (db_path and os.path.exists(db_path)):
             QMessageBox.warning(
                 self,
                 self.translate("WARNING"),
@@ -567,13 +663,22 @@ class SettingsDialog(QDialog):
         confirm = QMessageBox.question(
             self,
             self.translate("CONFIRM"),
-            self._t("SETTINGS_CONFIRM_DELETE_USERS", users=", ".join(user_labels))
+            self.translate("SETTINGS_CONFIRM_DELETE_USERS", users=", ".join(user_labels))
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
         try:
-            self.database_settings_service.delete_users(db_path, user_ids)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            for uid in user_ids:
+                if uid is None:
+                    cursor.execute("DELETE FROM downloads WHERE user_id IS NULL")
+                else:
+                    cursor.execute("DELETE FROM downloads WHERE user_id = ?", (uid,))
+            conn.commit()
+            conn.close()
+
             self._refresh_downloader_cache()
             QMessageBox.information(
                 self,
@@ -585,7 +690,7 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_DELETING_USERS", error=e)
+                self.translate("SETTINGS_ERROR_DELETING_USERS", error=e)
             )
             
     def _confirm_delete_database_text(self):
@@ -642,7 +747,7 @@ class SettingsDialog(QDialog):
 
     def _delete_entire_database(self):
         db_path = self._get_db_path()
-        if not self.database_settings_service.database_exists(db_path):
+        if not (db_path and os.path.exists(db_path)):
             QMessageBox.warning(
                 self,
                 self.translate("WARNING"),
@@ -670,7 +775,16 @@ class SettingsDialog(QDialog):
             return
 
         try:
-            self.database_settings_service.delete_all_downloads(db_path)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM downloads")
+            conn.commit()
+            try:
+                cursor.execute("VACUUM")
+            except Exception:
+                pass
+            conn.close()
+
             self._refresh_downloader_cache()
             self.load_db_records()
             QMessageBox.information(
@@ -682,51 +796,59 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_DELETING_ENTIRE_DATABASE", error=e)
+                self.translate("SETTINGS_ERROR_DELETING_ENTIRE_DATABASE", error=e)
             )
 
     # ------------------------------------------------------------
     # actions
     # ------------------------------------------------------------
     def _apply_language(self):
-        success, message = self.settings_service.apply_language_settings(
-            settings=self.settings,
-            selected_language_name=self.language_combo.currentText(),
-            languages=self.languages,
-            save_language_preference_func=self.save_language_preference,
-            load_translations_func=self.load_translations,
-            update_ui_texts_func=self.update_ui_texts,
-        )
+        selected_language_name = self.language_combo.currentText()
+        if selected_language_name not in self.languages:
+            QMessageBox.warning(self, self.translate("WARNING"), self.translate("PLEASE_SELECT_LANGUAGE"))
+            return
 
-        if success:
-            self._retranslate_ui()
-            QMessageBox.information(self, self.translate("SUCCESS"), self.translate(message))
-        else:
-            QMessageBox.warning(self, self.translate("WARNING"), self.translate(message))
+        selected_language_code = self.languages[selected_language_name]
+        self.settings["language"] = selected_language_code
+        self._save_settings_file(self.settings)
+        self.save_language_preference(selected_language_code)
+        self.load_translations(selected_language_code)
+        self.update_ui_texts()
+
+        self._retranslate_ui()
+        QMessageBox.information(self, self.translate("SUCCESS"), self.translate("LANGUAGE_APPLIED_SUCCESS"))
 
     def _apply_download_settings(self):
         try:
-            parsed_values = self.download_settings_service.parse_form_values(
-                max_downloads_value=self.max_downloads_combo.currentText(),
-                folder_structure_value=self.folder_structure_combo.currentText(),
-                max_retries_value=self.max_retries_combo.currentText(),
-                retry_interval_value=self.retry_interval_edit.text(),
-                file_naming_mode_label=self.file_naming_combo.currentText(),
-                max_profiles_value=self.max_profiles_combo.currentText(),
-            )
+            max_downloads = int(self.max_downloads_combo.currentText())
+            max_retries = int(self.max_retries_combo.currentText())
+            retry_interval = float(self.retry_interval_edit.text())
+            numeric_mode = self.NAMING_MODE_LABEL_TO_VALUE.get(self.file_naming_combo.currentText(), 0)
+            max_profiles = max(1, int(self.max_profiles_combo.currentText()))
 
-            self.settings = self.download_settings_service.apply_to_settings(
-                self.settings,
-                parsed_values
-            )
-            self.settings_service.save_settings(self.settings)
-            self.download_settings_service.apply_to_downloader(self.downloader, parsed_values)
+            self.settings["max_downloads"] = max_downloads
+            self.settings["folder_structure"] = self.folder_structure_combo.currentText()
+            self.settings["max_retries"] = max_retries
+            self.settings["retry_interval"] = retry_interval
+            self.settings["file_naming_mode"] = numeric_mode
+            self.settings["max_profiles_per_session"] = max_profiles
+
+            self._save_settings_file(self.settings)
+
+            if self.downloader:
+                if hasattr(self.downloader, "update_max_downloads"):
+                    self.downloader.update_max_downloads(max_downloads)
+                else:
+                    self.downloader.max_workers = max_downloads
+                self.downloader.max_retries = max_retries
+                self.downloader.retry_interval = retry_interval
+                self.downloader.file_naming_mode = numeric_mode
 
             if self.parent_window is not None:
                 if hasattr(self.parent_window, "settings"):
                     self.parent_window.settings = self.settings
                 if hasattr(self.parent_window, "max_downloads"):
-                    self.parent_window.max_downloads = parsed_values["max_downloads"]
+                    self.parent_window.max_downloads = max_downloads
 
             QMessageBox.information(
                 self,
@@ -744,7 +866,7 @@ class SettingsDialog(QDialog):
     def _save_cookies(self):
         cookies_text = self.cookies_text.toPlainText().strip()
         try:
-            self.cookies_settings_service.save_cookies_text(cookies_text)
+            self._save_cookies_text(cookies_text)
             self._reload_cookies_text()
             self._update_cookies_status()
             QMessageBox.information(
@@ -756,7 +878,7 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_SAVING_COOKIES", error=e)
+                self.translate("SETTINGS_ERROR_SAVING_COOKIES", error=e)
             )
 
     def _import_cookies(self):
@@ -770,8 +892,9 @@ class SettingsDialog(QDialog):
             return
 
         try:
-            content = self.cookies_settings_service.import_cookies_file(file_path)
-            self.cookies_settings_service.save_cookies_text(content)
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self._save_cookies_text(content)
             self._reload_cookies_text()
             self._update_cookies_status()
             QMessageBox.information(
@@ -783,7 +906,7 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_IMPORTING_COOKIES", error=e)
+                self.translate("SETTINGS_ERROR_IMPORTING_COOKIES", error=e)
             )
 
     def _clear_cookies(self):
@@ -796,7 +919,9 @@ class SettingsDialog(QDialog):
             return
 
         try:
-            self.cookies_settings_service.clear_cookies()
+            os.makedirs(os.path.dirname(self.COOKIES_PATH), exist_ok=True)
+            with open(self.COOKIES_PATH, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=4, ensure_ascii=False)
             self._reload_cookies_text()
             self._update_cookies_status()
             QMessageBox.information(
@@ -808,11 +933,11 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
-                self._t("SETTINGS_ERROR_CLEARING_COOKIES", error=e)
+                self.translate("SETTINGS_ERROR_CLEARING_COOKIES", error=e)
             )
 
     def _retranslate_ui(self):
-        self.setWindowTitle(self._t("SETTINGS_WINDOW_TITLE", version=self.version))
+        self.setWindowTitle(self.translate("SETTINGS_WINDOW_TITLE", version=self.version))
 
         self.tabs.setTabText(0, self.translate("SETTINGS_TAB_GENERAL"))
         self.tabs.setTabText(1, self.translate("SETTINGS_TAB_DOWNLOADS"))

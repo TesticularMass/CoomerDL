@@ -95,14 +95,6 @@ class UrlService:
                 is_profile=True,
             )
 
-        if "jpg5.su" in raw_url:
-            return ParsedDownloadUrl(
-                parsed_url=parsed,
-                site_type="jpg5",
-                host=host,
-                is_profile=True,
-            )
-
         if "coomerfans.com" in raw_url:
             is_post = "/p/" in raw_url
             is_profile = "/u/" in raw_url
