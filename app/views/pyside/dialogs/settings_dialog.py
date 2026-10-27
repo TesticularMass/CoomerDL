@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QComboBox,
+    QCheckBox,
     QLineEdit,
     QMessageBox,
     QTreeWidget,
@@ -24,9 +25,19 @@ from PySide6.QtGui import QFontDatabase
 
 import shutil
 import sqlite3
+from app.controllers.main_controller import apply_file_settings
 from app.models.profile_session import DEFAULT_MAX_PROFILES_PER_SESSION
 from app.services.settings_service import SettingsService
 from app.views.pyside.progress.progress_item_widget import format_bytes
+from downloader.core.base_api_downloader import CUSTOM_TEMPLATE_MODE, DEFAULT_DB_PATH
+from downloader.core.filename_template import (
+    DEFAULT_TEMPLATE,
+    SAMPLE_FIELDS,
+    TEMPLATE_TOKENS,
+    TemplateError,
+    render_template,
+    validate_template,
+)
 
 
 class SettingsDialog(QDialog):
@@ -35,6 +46,7 @@ class SettingsDialog(QDialog):
         "Use Sanitized Post Name": 1,
         "Post Name + Post ID Suffix": 2,
         "Post Date/Time + Post Name": 3,
+        "Custom template": CUSTOM_TEMPLATE_MODE,
     }
 
     NAMING_MODE_VALUE_TO_LABEL = {v: k for k, v in NAMING_MODE_LABEL_TO_VALUE.items()}
@@ -216,6 +228,18 @@ class SettingsDialog(QDialog):
     def _build_downloads_tab(self):
         layout = QFormLayout(self.downloads_tab)
 
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        current_folder = getattr(self.parent_window, "download_folder", None) or self.settings.get("download_folder", "")
+        self.download_folder_edit = QLineEdit(current_folder)
+        folder_layout.addWidget(self.download_folder_edit, 1)
+        self.download_folder_browse = QPushButton(self.translate("SELECT_FOLDER"))
+        self.download_folder_browse.clicked.connect(self._browse_download_folder)
+        folder_layout.addWidget(self.download_folder_browse)
+        self.download_folder_label = QLabel(self.translate("SETTINGS_DOWNLOAD_FOLDER"))
+        layout.addRow(self.download_folder_label, folder_row)
+
         self.max_downloads_combo = QComboBox()
         self.max_downloads_combo.addItems([str(i) for i in range(1, 33)])
         self.max_downloads_combo.setCurrentText(str(self.settings.get("max_downloads", 3)))
@@ -256,9 +280,71 @@ class SettingsDialog(QDialog):
         self.file_naming_label = QLabel(self.translate("SETTINGS_FILE_NAMING_MODE"))
         layout.addRow(self.file_naming_label, self.file_naming_combo)
 
+        self.file_template_edit = QLineEdit(self.settings.get("file_name_template") or DEFAULT_TEMPLATE)
+        self.file_template_edit.setPlaceholderText(DEFAULT_TEMPLATE)
+        self.file_template_label = QLabel(self.translate("SETTINGS_FILE_NAME_TEMPLATE"))
+        layout.addRow(self.file_template_label, self.file_template_edit)
+
+        self.file_template_preview = QLabel("")
+        self.file_template_preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addRow("", self.file_template_preview)
+
+        self.file_template_help = QLabel(self._template_help_text())
+        self.file_template_help.setWordWrap(True)
+        self.file_template_help.setStyleSheet("color: #bfbfbf;")
+        layout.addRow("", self.file_template_help)
+
+        self.file_naming_combo.currentTextChanged.connect(self._update_template_controls)
+        self.file_template_edit.textChanged.connect(self._update_template_controls)
+        self._update_template_controls()
+
+        self.skip_downloaded_check = QCheckBox(self.translate("SETTINGS_SKIP_DOWNLOADED"))
+        self.skip_downloaded_check.setChecked(bool(self.settings.get("skip_downloaded", True)))
+        self.skip_downloaded_check.setToolTip(self.translate("SETTINGS_SKIP_DOWNLOADED_TOOLTIP"))
+        layout.addRow("", self.skip_downloaded_check)
+
+        self.dedupe_check = QCheckBox(self.translate("SETTINGS_DEDUPE_BY_HASH"))
+        self.dedupe_check.setChecked(bool(self.settings.get("dedupe_by_hash", True)))
+        self.dedupe_check.setToolTip(self.translate("SETTINGS_DEDUPE_BY_HASH_TOOLTIP"))
+        layout.addRow("", self.dedupe_check)
+
         self.apply_downloads_button = QPushButton(self.translate("SETTINGS_APPLY_DOWNLOAD_SETTINGS"))
         self.apply_downloads_button.clicked.connect(self._apply_download_settings)
         layout.addRow("", self.apply_downloads_button)
+
+    def _template_help_text(self):
+        tokens = ", ".join("{" + name + "}" for name, _ in TEMPLATE_TOKENS)
+        return self.translate("SETTINGS_FILE_NAME_TEMPLATE_HELP", tokens=tokens)
+
+    def _is_custom_naming_selected(self):
+        return self.NAMING_MODE_LABEL_TO_VALUE.get(self.file_naming_combo.currentText()) == CUSTOM_TEMPLATE_MODE
+
+    def _update_template_controls(self, *_):
+        custom = self._is_custom_naming_selected()
+        for widget in (self.file_template_label, self.file_template_edit,
+                       self.file_template_preview, self.file_template_help):
+            widget.setVisible(custom)
+        if not custom:
+            return
+        try:
+            validate_template(self.file_template_edit.text())
+            example = render_template(self.file_template_edit.text(), SAMPLE_FIELDS)
+            self.file_template_preview.setStyleSheet("")
+            self.file_template_preview.setText(
+                self.translate("SETTINGS_FILE_NAME_TEMPLATE_EXAMPLE", example=example)
+            )
+        except TemplateError as e:
+            self.file_template_preview.setStyleSheet("color: #e06c75;")
+            self.file_template_preview.setText(str(e))
+
+    def _browse_download_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            self.translate("SELECT_FOLDER"),
+            self.download_folder_edit.text().strip() or "",
+        )
+        if folder:
+            self.download_folder_edit.setText(folder)
 
     def _build_cookies_tab(self):
         layout = QVBoxLayout(self.cookies_tab)
@@ -340,6 +426,19 @@ class SettingsDialog(QDialog):
         self.database_info_label = QLabel(self.translate("SETTINGS_DATABASE_INFO"))
         self.database_info_label.setWordWrap(True)
         layout.addWidget(self.database_info_label)
+
+        location_row = QHBoxLayout()
+        self.db_location_label = QLabel(self.translate("SETTINGS_DATABASE_LOCATION"))
+        location_row.addWidget(self.db_location_label)
+        self.db_location_edit = QLineEdit(os.path.abspath(self._get_db_path()))
+        location_row.addWidget(self.db_location_edit, 1)
+        self.db_location_browse = QPushButton(self.translate("SETTINGS_BROWSE"))
+        self.db_location_browse.clicked.connect(self._browse_db_location)
+        location_row.addWidget(self.db_location_browse)
+        self.db_location_apply = QPushButton(self.translate("SETTINGS_APPLY_DATABASE_LOCATION"))
+        self.db_location_apply.clicked.connect(self._apply_db_location)
+        location_row.addWidget(self.db_location_apply)
+        layout.addLayout(location_row)
 
         self.db_search_edit = QLineEdit()
         self.db_search_edit.setClearButtonEnabled(True)
@@ -432,6 +531,7 @@ class SettingsDialog(QDialog):
         )
         self.file_naming_combo.setCurrentText(current_naming_label)
         self.file_naming_combo.blockSignals(False)
+        self._update_template_controls()
 
     def _reload_cookies_text(self):
         self.cookies_text.setPlainText(self._load_cookies_text())
@@ -440,9 +540,84 @@ class SettingsDialog(QDialog):
     # Database
     # ------------------------------------------------------------
     def _get_db_path(self):
-        if self.downloader and hasattr(self.downloader, "db_path") and self.downloader.db_path:
-            return self.downloader.db_path
-        return "resources/config/downloads.db"
+        return self.settings.get("database_path") or DEFAULT_DB_PATH
+
+    def _browse_db_location(self):
+        current = self.db_location_edit.text().strip() or os.path.abspath(self._get_db_path())
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.translate("SETTINGS_DATABASE_LOCATION"),
+            current,
+            "SQLite DB (*.db);;All Files (*)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if path:
+            if not os.path.splitext(path)[1]:
+                path += ".db"
+            self.db_location_edit.setText(path)
+
+    def _apply_db_location(self):
+        new_path = self.db_location_edit.text().strip()
+        if not new_path:
+            return
+        new_path = os.path.abspath(os.path.expanduser(new_path))
+        old_path = os.path.abspath(self._get_db_path())
+        if os.path.normcase(new_path) == os.path.normcase(old_path):
+            return
+
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            if os.path.exists(new_path):
+                # Switching to another database: make sure it is one.
+                conn = sqlite3.connect(new_path)
+                try:
+                    conn.execute("PRAGMA schema_version").fetchone()
+                finally:
+                    conn.close()
+                message_key = "SETTINGS_DATABASE_USING_EXISTING"
+            else:
+                message_key = "SETTINGS_DATABASE_LOCATION_CHANGED"
+                if os.path.exists(old_path):
+                    answer = QMessageBox.question(
+                        self,
+                        self.translate("CONFIRM"),
+                        self.translate("SETTINGS_DATABASE_COPY_PROMPT"),
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.No
+                        | QMessageBox.StandardButton.Cancel,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if answer == QMessageBox.StandardButton.Cancel:
+                        return
+                    if answer == QMessageBox.StandardButton.Yes:
+                        # The backup API gives a consistent copy even while a
+                        # download is writing to the old file.
+                        src = sqlite3.connect(old_path)
+                        dst = sqlite3.connect(new_path)
+                        try:
+                            src.backup(dst)
+                        finally:
+                            dst.close()
+                            src.close()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                self.translate("ERROR"),
+                self.translate("SETTINGS_ERROR_DATABASE_LOCATION", error=e),
+            )
+            return
+
+        self.settings["database_path"] = new_path
+        self._save_settings_file(self.settings)
+        if self.parent_window is not None and isinstance(getattr(self.parent_window, "settings", None), dict):
+            self.parent_window.settings["database_path"] = new_path
+        self.db_location_edit.setText(new_path)
+        self.load_db_records()
+        QMessageBox.information(
+            self,
+            self.translate("SUCCESS"),
+            self.translate(message_key, path=new_path),
+        )
 
     def _make_db_file_item(self, item):
         return QTreeWidgetItem([
@@ -583,7 +758,11 @@ class SettingsDialog(QDialog):
             self.db_tree.collapseAll()
 
     def _refresh_downloader_cache(self):
-        if self.downloader is not None and hasattr(self.downloader, "load_download_cache"):
+        if self.downloader is None or not hasattr(self.downloader, "load_download_cache"):
+            return
+        same_db = os.path.normcase(os.path.abspath(getattr(self.downloader, "db_path", "") or "")) == \
+            os.path.normcase(os.path.abspath(self._get_db_path()))
+        if same_db:
             try:
                 self.downloader.load_download_cache()
             except Exception:
@@ -825,43 +1004,79 @@ class SettingsDialog(QDialog):
             retry_interval = float(self.retry_interval_edit.text())
             numeric_mode = self.NAMING_MODE_LABEL_TO_VALUE.get(self.file_naming_combo.currentText(), 0)
             max_profiles = max(1, int(self.max_profiles_combo.currentText()))
-
-            self.settings["max_downloads"] = max_downloads
-            self.settings["folder_structure"] = self.folder_structure_combo.currentText()
-            self.settings["max_retries"] = max_retries
-            self.settings["retry_interval"] = retry_interval
-            self.settings["file_naming_mode"] = numeric_mode
-            self.settings["max_profiles_per_session"] = max_profiles
-
-            self._save_settings_file(self.settings)
-
-            if self.downloader:
-                if hasattr(self.downloader, "update_max_downloads"):
-                    self.downloader.update_max_downloads(max_downloads)
-                else:
-                    self.downloader.max_workers = max_downloads
-                self.downloader.max_retries = max_retries
-                self.downloader.retry_interval = retry_interval
-                self.downloader.file_naming_mode = numeric_mode
-
-            if self.parent_window is not None:
-                if hasattr(self.parent_window, "settings"):
-                    self.parent_window.settings = self.settings
-                if hasattr(self.parent_window, "max_downloads"):
-                    self.parent_window.max_downloads = max_downloads
-
-            QMessageBox.information(
-                self,
-                self.translate("SUCCESS"),
-                self.translate("SETTINGS_DOWNLOADS_APPLIED_SUCCESS")
-            )
-
         except ValueError:
             QMessageBox.critical(
                 self,
                 self.translate("ERROR"),
                 self.translate("SETTINGS_INVALID_NUMERIC_VALUES")
             )
+            return
+
+        template = self.file_template_edit.text().strip() or DEFAULT_TEMPLATE
+        if numeric_mode == CUSTOM_TEMPLATE_MODE:
+            try:
+                validate_template(template)
+            except TemplateError as e:
+                QMessageBox.critical(
+                    self,
+                    self.translate("ERROR"),
+                    self.translate("SETTINGS_INVALID_FILE_NAME_TEMPLATE", error=e),
+                )
+                return
+
+        folder = self.download_folder_edit.text().strip()
+        if not folder:
+            QMessageBox.critical(
+                self,
+                self.translate("ERROR"),
+                self.translate("PLEASE_SELECT_DOWNLOAD_FOLDER"),
+            )
+            return
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(
+                self,
+                self.translate("ERROR"),
+                self.translate("SETTINGS_INVALID_DOWNLOAD_FOLDER", error=e),
+            )
+            return
+
+        self.settings["max_downloads"] = max_downloads
+        self.settings["folder_structure"] = self.folder_structure_combo.currentText()
+        self.settings["max_retries"] = max_retries
+        self.settings["retry_interval"] = retry_interval
+        self.settings["file_naming_mode"] = numeric_mode
+        self.settings["max_profiles_per_session"] = max_profiles
+        self.settings["file_name_template"] = template
+        self.settings["skip_downloaded"] = self.skip_downloaded_check.isChecked()
+        self.settings["dedupe_by_hash"] = self.dedupe_check.isChecked()
+        self.settings["download_folder"] = folder
+
+        self._save_settings_file(self.settings)
+
+        if self.downloader:
+            if hasattr(self.downloader, "update_max_downloads"):
+                self.downloader.update_max_downloads(max_downloads)
+            else:
+                self.downloader.max_workers = max_downloads
+            self.downloader.max_retries = max_retries
+            self.downloader.retry_interval = retry_interval
+            apply_file_settings(self.downloader, self.settings)
+
+        if self.parent_window is not None:
+            if hasattr(self.parent_window, "settings"):
+                self.parent_window.settings = self.settings
+            if hasattr(self.parent_window, "max_downloads"):
+                self.parent_window.max_downloads = max_downloads
+            if hasattr(self.parent_window, "set_download_folder"):
+                self.parent_window.set_download_folder(folder)
+
+        QMessageBox.information(
+            self,
+            self.translate("SUCCESS"),
+            self.translate("SETTINGS_DOWNLOADS_APPLIED_SUCCESS")
+        )
 
     def _save_cookies(self):
         cookies_text = self.cookies_text.toPlainText().strip()
@@ -945,12 +1160,20 @@ class SettingsDialog(QDialog):
         self.tabs.setTabText(3, self.translate("SETTINGS_TAB_DATABASE"))
 
         self.language_label.setText(self.translate("SETTINGS_LANGUAGE"))
+        self.download_folder_label.setText(self.translate("SETTINGS_DOWNLOAD_FOLDER"))
+        self.download_folder_browse.setText(self.translate("SELECT_FOLDER"))
         self.max_downloads_label.setText(self.translate("SETTINGS_MAX_DOWNLOADS"))
         self.max_profiles_label.setText(self.translate("SETTINGS_MAX_PROFILES_PER_SESSION"))
         self.folder_structure_label.setText(self.translate("SETTINGS_FOLDER_STRUCTURE"))
         self.max_retries_label.setText(self.translate("SETTINGS_MAX_RETRIES"))
         self.retry_interval_label.setText(self.translate("SETTINGS_RETRY_INTERVAL_SECONDS"))
         self.file_naming_label.setText(self.translate("SETTINGS_FILE_NAMING_MODE"))
+        self.file_template_label.setText(self.translate("SETTINGS_FILE_NAME_TEMPLATE"))
+        self.file_template_help.setText(self._template_help_text())
+        self.skip_downloaded_check.setText(self.translate("SETTINGS_SKIP_DOWNLOADED"))
+        self.skip_downloaded_check.setToolTip(self.translate("SETTINGS_SKIP_DOWNLOADED_TOOLTIP"))
+        self.dedupe_check.setText(self.translate("SETTINGS_DEDUPE_BY_HASH"))
+        self.dedupe_check.setToolTip(self.translate("SETTINGS_DEDUPE_BY_HASH_TOOLTIP"))
 
         self.apply_language_button.setText(self.translate("SETTINGS_APPLY_LANGUAGE"))
         self.apply_downloads_button.setText(self.translate("SETTINGS_APPLY_DOWNLOAD_SETTINGS"))
@@ -964,6 +1187,9 @@ class SettingsDialog(QDialog):
         self.clear_cookies_button.setText(self.translate("SETTINGS_CLEAR_COOKIES"))
 
         self.database_info_label.setText(self.translate("SETTINGS_DATABASE_INFO"))
+        self.db_location_label.setText(self.translate("SETTINGS_DATABASE_LOCATION"))
+        self.db_location_browse.setText(self.translate("SETTINGS_BROWSE"))
+        self.db_location_apply.setText(self.translate("SETTINGS_APPLY_DATABASE_LOCATION"))
         self.db_search_edit.setPlaceholderText(self.translate("SETTINGS_DB_SEARCH_PLACEHOLDER"))
         self.reload_db_button.setText(self.translate("SETTINGS_RELOAD_DATABASE"))
         self.export_db_button.setText(self.translate("SETTINGS_EXPORT_DATABASE"))

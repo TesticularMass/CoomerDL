@@ -6,6 +6,8 @@ from app.models.download_request import DownloadRequest
 from app.version import USER_AGENT
 from downloader.bunkr import BunkrDownloader
 from downloader.coomerfans import CoomerfansDownloader
+from downloader.core.base_api_downloader import DEFAULT_DB_PATH
+from downloader.core.filename_template import DEFAULT_TEMPLATE
 from downloader.downloader import Downloader
 from downloader.erome import EromeDownloader
 from downloader.simpcity import SimpCity
@@ -37,6 +39,17 @@ class JobResolutionError:
     # Whether the single-URL flow shows an error dialog for this failure
     # (the unknown-site case historically only logs).
     show_popup: bool = True
+
+
+def apply_file_settings(downloader, settings: dict):
+    """Copy naming, database and duplicate options onto a downloader."""
+    try:
+        downloader.file_naming_mode = int(settings.get("file_naming_mode", 0) or 0)
+    except (TypeError, ValueError):
+        downloader.file_naming_mode = 0
+    downloader.file_name_template = settings.get("file_name_template") or DEFAULT_TEMPLATE
+    downloader.skip_downloaded = bool(settings.get("skip_downloaded", True))
+    downloader.dedupe_by_hash = bool(settings.get("dedupe_by_hash", True))
 
 
 class MainController:
@@ -104,10 +117,11 @@ class MainController:
             "max_workers": self.app.max_downloads,
             "max_retries": int(settings.get("max_retries", 3) or 3),
             "retry_interval": float(settings.get("retry_interval", 2.0) or 2.0),
+            "db_path": settings.get("database_path") or DEFAULT_DB_PATH,
             **extra,
         }
         downloader = cls(**kwargs)
-        downloader.file_naming_mode = settings.get("file_naming_mode", 0)
+        apply_file_settings(downloader, settings)
         self.app.active_downloader = downloader
         return downloader
 

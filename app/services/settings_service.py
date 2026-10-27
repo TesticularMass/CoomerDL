@@ -10,6 +10,10 @@ class SettingsService:
         "max_retries": 3,
         "retry_interval": 2.0,
         "file_naming_mode": 0,
+        "file_name_template": "{date} - {title}_{index}{ext}",
+        "skip_downloaded": True,
+        "dedupe_by_hash": True,
+        "database_path": "resources/config/downloads.db",
     }
 
     def __init__(self, settings_path="resources/config/settings.json"):

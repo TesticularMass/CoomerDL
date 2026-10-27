@@ -763,9 +763,14 @@ class PySideMainWindow(QMainWindow):
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, self.tr("SELECT_FOLDER"), self.download_folder or "")
         if folder:
-            self.download_folder = folder
-            self.settings_service.save_download_folder(folder)
-            self.update_folder_label()
+            self.set_download_folder(folder)
+
+    def set_download_folder(self, folder):
+        self.download_folder = folder
+        self.settings_service.save_download_folder(folder)
+        if isinstance(getattr(self, "settings", None), dict):
+            self.settings["download_folder"] = folder
+        self.update_folder_label()
 
     def update_folder_label(self):
         path = self.download_folder or ""

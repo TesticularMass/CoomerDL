@@ -11,6 +11,25 @@ import time
 import zlib
 import sqlite3
 
+import xxhash
+
+from downloader.core.filename_template import (
+    DEFAULT_TEMPLATE,
+    TemplateError,
+    date_from_published,
+    render_template,
+)
+
+# Mode value for the user-defined filename template; 0-3 are the presets.
+CUSTOM_TEMPLATE_MODE = 4
+HASH_CHUNK_SIZE = 1048576
+# XXH3 is far faster than SHA-256; the 128-bit variant costs the same as the
+# 64-bit one and makes an accidental match (which deletes a file) negligible.
+new_hasher = xxhash.xxh3_128
+# Hex digest length; stored hashes of another length predate XXH3.
+HASH_HEX_LENGTH = 32
+DEFAULT_DB_PATH = os.path.join("resources", "config", "downloads.db")
+
 
 class BaseApiDownloader:
     def __init__(
@@ -30,6 +49,7 @@ class BaseApiDownloader:
         tr=None,
         folder_structure="default",
         rate_limit_interval=1.0,
+        db_path=None,
     ):
         self.download_folder = download_folder
         self.log_callback = log_callback
@@ -76,6 +96,16 @@ class BaseApiDownloader:
         # Query parameters that carry the original filename (bunkr uses n).
         self.filename_query_keys = ("n",)
 
+        # Overwritten from settings by the controller after construction.
+        self.file_naming_mode = 0
+        self.file_name_template = DEFAULT_TEMPLATE
+        self.skip_downloaded = True
+        self.dedupe_by_hash = True
+        self.duplicate_files = []
+        self._template_error_logged = False
+        self._hash_backfill_done = set()
+        self._backfill_lock = threading.Lock()
+
         self.domain_error_state = defaultdict(
             lambda: {
                 "burst_count": 0,
@@ -88,9 +118,10 @@ class BaseApiDownloader:
         self.domain_error_threshold = 4
         self.domain_cooldown_seconds = 8.0
 
-        db_folder = os.path.join("resources", "config")
-        os.makedirs(db_folder, exist_ok=True)
-        self.db_path = os.path.join(db_folder, "downloads.db")
+        self.db_path = db_path or DEFAULT_DB_PATH
+        db_folder = os.path.dirname(self.db_path)
+        if db_folder:
+            os.makedirs(db_folder, exist_ok=True)
         self.db_lock = threading.Lock()
         self.init_db()
         self.load_download_cache()
@@ -116,9 +147,18 @@ class BaseApiDownloader:
                 file_size INTEGER,
                 user_id TEXT,
                 post_id TEXT,
-                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                file_hash TEXT
             )
             """
+        )
+        # Databases created before hashing existed lack the column.
+        self.db_cursor.execute("PRAGMA table_info(downloads)")
+        columns = {row[1] for row in self.db_cursor.fetchall()}
+        if "file_hash" not in columns:
+            self.db_cursor.execute("ALTER TABLE downloads ADD COLUMN file_hash TEXT")
+        self.db_cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloads_file_hash ON downloads(file_hash)"
         )
         self.db_connection.commit()
 
@@ -162,6 +202,8 @@ class BaseApiDownloader:
             if self.enable_widgets_callback:
                 self.enable_widgets_callback()
             self.log("ALL_DOWNLOADS_COMPLETED_OR_CANCELLED")
+            if self.duplicate_files:
+                self.log("DUPLICATES_REMOVED_SUMMARY", count=len(self.duplicate_files))
             if self.failed_files:
                 self.log("DOWNLOAD_SUMMARY_FAILED", failed=len(self.failed_files))
             with self.db_lock:
@@ -194,17 +236,37 @@ class BaseApiDownloader:
 
         return path_name
 
-    def get_filename(self, media_url, post_id=None, post_name=None, attachment_index=1, post_time=None):
-        base_name = self._filename_from_url(media_url)
+    def get_filename(self, media_url, post_id=None, post_name=None, attachment_index=1, post_time=None,
+                     user=None, forced_name=None):
+        base_name = forced_name or self._filename_from_url(media_url)
         name_no_ext, extension = os.path.splitext(base_name)
-
-        if not hasattr(self, "file_naming_mode"):
-            self.file_naming_mode = 0
 
         mode = self.file_naming_mode
 
         def sanitize(name):
             return self.sanitize_filename(name).strip()
+
+        if mode == CUSTOM_TEMPLATE_MODE:
+            fields = {
+                "name": name_no_ext,
+                "ext": extension,
+                "index": attachment_index,
+                "title": post_name or "",
+                "post_id": post_id or "",
+                "published": post_time or "",
+                "date": date_from_published(post_time),
+                "user": user or "",
+                "site": getattr(self, "domain_name", "") or "",
+                "type": self._media_type_folder(extension.lower()),
+                "url_hash": f"{zlib.crc32(media_url.encode('utf-8')) & 0xFFFF:04x}",
+            }
+            try:
+                return render_template(self.file_name_template or DEFAULT_TEMPLATE, fields)
+            except TemplateError as e:
+                if not self._template_error_logged:
+                    self._template_error_logged = True
+                    self.log("FILENAME_TEMPLATE_INVALID", error=e)
+                mode = 0
 
         if mode == 0:
             sanitized = sanitize(name_no_ext) or "file"
@@ -224,22 +286,160 @@ class BaseApiDownloader:
 
         return sanitize(name_no_ext) + extension
 
-    def get_media_folder(self, extension, user_id, post_id=None):
+    def _media_type_folder(self, extension):
         if extension in self.video_extensions:
-            folder_name = "videos"
+            return "videos"
         elif extension in self.image_extensions:
-            folder_name = "images"
+            return "images"
         elif extension in self.document_extensions:
-            folder_name = "documents"
+            return "documents"
         elif extension in self.compressed_extensions:
-            folder_name = "compressed"
-        else:
-            folder_name = "other"
+            return "compressed"
+        return "other"
+
+    def get_media_folder(self, extension, user_id, post_id=None):
+        folder_name = self._media_type_folder(extension)
 
         if self.folder_structure == "post_number" and post_id:
             return os.path.join(self.download_folder, user_id, f"post_{post_id}", folder_name)
 
         return os.path.join(self.download_folder, user_id, folder_name)
+
+    # ------------------------------------------------------------------
+    # Hashing and duplicate detection
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(os.path.abspath(path))
+
+    def _model_root(self, media_folder):
+        """The top-level folder of the model (user, album or thread) a file
+        belongs to; duplicates are only looked for inside it."""
+        base = os.path.abspath(self.download_folder or ".")
+        folder = os.path.abspath(media_folder)
+        try:
+            rel = os.path.relpath(folder, base)
+        except ValueError:
+            return folder
+        if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+            return folder
+        return os.path.join(base, rel.split(os.sep)[0])
+
+    def _hash_file(self, path):
+        hasher = new_hasher()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(HASH_CHUNK_SIZE), b""):
+                    hasher.update(chunk)
+        except OSError:
+            return None
+        return hasher.hexdigest()
+
+    def _backfill_model_hashes(self, model_root):
+        """Hash files recorded before hashing existed (or with an older hash
+        algorithm), once per model, so new downloads can be compared against them."""
+        root_key = self._path_key(model_root)
+        with self._backfill_lock:
+            if root_key in self._hash_backfill_done:
+                return
+
+            with self.db_lock:
+                self.db_cursor.execute(
+                    "SELECT id, file_path FROM downloads "
+                    "WHERE (file_hash IS NULL OR length(file_hash) != ?) "
+                    "AND file_path IS NOT NULL",
+                    (HASH_HEX_LENGTH,),
+                )
+                rows = self.db_cursor.fetchall()
+
+            pending = [
+                (row_id, path) for row_id, path in rows
+                if self._path_key(path).startswith(root_key + os.sep) and os.path.isfile(path)
+            ]
+            if pending:
+                self.log("HASHING_EXISTING_FILES", count=len(pending), folder=model_root)
+
+            for row_id, path in pending:
+                if self.cancel_requested.is_set():
+                    return
+                file_hash = self._hash_file(path)
+                if file_hash:
+                    with self.db_lock:
+                        self.db_cursor.execute(
+                            "UPDATE downloads SET file_hash = ? WHERE id = ?",
+                            (file_hash, row_id),
+                        )
+                        self.db_connection.commit()
+
+            self._hash_backfill_done.add(root_key)
+
+    def _find_duplicate(self, file_hash, model_root, exclude_path=None):
+        """Path of an existing file in the same model with this hash.
+        Caller must hold db_lock."""
+        root_key = self._path_key(model_root)
+        exclude_key = self._path_key(exclude_path) if exclude_path else None
+        self.db_cursor.execute(
+            "SELECT file_path FROM downloads WHERE file_hash = ?", (file_hash,)
+        )
+        for (path,) in self.db_cursor.fetchall():
+            if not path:
+                continue
+            key = self._path_key(path)
+            if key == exclude_key or not key.startswith(root_key + os.sep):
+                continue
+            if os.path.isfile(path):
+                return path
+        return None
+
+    @staticmethod
+    def _unique_path(path):
+        stem, ext = os.path.splitext(path)
+        n = 2
+        while os.path.exists(f"{stem} ({n}){ext}"):
+            n += 1
+        return f"{stem} ({n}){ext}"
+
+    def _commit_download(self, tmp_path, final_path, file_hash, model_root, record_url, size, user_id, post_id):
+        """Move a finished download into place and record it in the database.
+
+        Returns (path_on_disk, is_duplicate). Only called once the file is
+        complete, so the database never holds partial downloads.
+        """
+        if self.dedupe_by_hash:
+            self._backfill_model_hashes(model_root)
+
+        # Hash a same-named file outside the locks; this is the slow part.
+        existing_hash = self._hash_file(final_path) if os.path.exists(final_path) else None
+
+        with self.db_lock:
+            duplicate_of = None
+            if self.dedupe_by_hash:
+                duplicate_of = self._find_duplicate(file_hash, model_root, exclude_path=final_path)
+
+            with self.file_lock:
+                if duplicate_of is None and existing_hash == file_hash and os.path.exists(final_path):
+                    duplicate_of = final_path
+
+                if duplicate_of is not None:
+                    os.remove(tmp_path)
+                    path = duplicate_of
+                else:
+                    # Never overwrite a different file that took this name.
+                    path = self._unique_path(final_path) if os.path.exists(final_path) else final_path
+                    os.replace(tmp_path, path)
+                self.completed_files += 1
+
+            self.db_cursor.execute(
+                """
+                INSERT OR REPLACE INTO downloads (media_url, file_path, file_size, user_id, post_id, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (record_url, path, size, user_id, post_id, file_hash),
+            )
+            self.db_connection.commit()
+            self.download_cache[record_url] = (path, size)
+
+        return path, duplicate_of is not None
 
     def _compute_retry_delay(self, attempt_index, response=None):
         if response is not None:
@@ -424,27 +624,32 @@ class BaseApiDownloader:
             self.post_attachment_counter[counter_key] += 1
             attachment_index = self.post_attachment_counter[counter_key]
 
-        filename = forced_filename or self.get_filename(
-            media_url,
-            post_id=post_id,
-            post_name=post_name,
-            post_time=post_time,
-            attachment_index=attachment_index,
-        )
-
         if target_folder:
             media_folder = target_folder
         else:
             effective_user_id = user_id or "generic"
             media_folder = self.get_media_folder(extension, effective_user_id, post_id)
 
-        os.makedirs(media_folder, exist_ok=True)
+        model_root = self._model_root(media_folder)
+
+        if forced_filename and self.file_naming_mode != CUSTOM_TEMPLATE_MODE:
+            filename = forced_filename
+        else:
+            filename = self.get_filename(
+                media_url,
+                post_id=post_id,
+                post_name=post_name,
+                post_time=post_time,
+                attachment_index=attachment_index,
+                user=user_id or os.path.basename(model_root),
+                forced_name=forced_filename,
+            )
 
         final_path = os.path.normpath(os.path.join(media_folder, filename))
         tmp_path = f"{final_path}.{threading.get_ident()}.tmp"
 
         with self.db_lock:
-            already_downloaded = record_url in self.download_cache
+            already_downloaded = self.skip_downloaded and record_url in self.download_cache
 
         if already_downloaded:
             self.log("FILE_ALREADY_IN_DB_SKIPPING", media_url=record_url)
@@ -452,6 +657,8 @@ class BaseApiDownloader:
                 self.skipped_files.append(final_path)
             self._emit_global_progress()
             return
+
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
 
         self.log("STARTING_DOWNLOAD_FROM", media_url=media_url)
 
@@ -478,6 +685,7 @@ class BaseApiDownloader:
                 total_size = int(response.headers.get("content-length", 0))
                 downloaded_size = 0
                 start_time = time.time()
+                hasher = new_hasher()
 
                 with open(tmp_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=1048576):
@@ -485,6 +693,7 @@ class BaseApiDownloader:
                             raise Exception("CANCELLATION_REQUESTED")
                         if chunk:
                             f.write(chunk)
+                            hasher.update(chunk)
                             downloaded_size += len(chunk)
                             if self.update_progress_callback:
                                 elapsed_time = time.time() - start_time
@@ -519,6 +728,7 @@ class BaseApiDownloader:
                     if part_response.status_code == 200:
                         downloaded_size = 0
                         open_mode = "wb"
+                        hasher = new_hasher()
                     else:
                         open_mode = "ab"
 
@@ -530,6 +740,7 @@ class BaseApiDownloader:
                                 raise Exception("CANCELLATION_REQUESTED")
                             if chunk:
                                 f.write(chunk)
+                                hasher.update(chunk)
                                 downloaded_size += len(chunk)
                                 if self.update_progress_callback:
                                     elapsed_time = time.time() - start_time
@@ -562,25 +773,24 @@ class BaseApiDownloader:
                     )
                 )
 
-            with self.file_lock:
-                if os.path.exists(final_path):
-                    os.remove(final_path)
-                os.rename(tmp_path, final_path)
-                self.completed_files += 1
+            saved_path, is_duplicate = self._commit_download(
+                tmp_path,
+                final_path,
+                hasher.hexdigest(),
+                model_root,
+                record_url,
+                downloaded_size,
+                user_id,
+                post_id,
+            )
 
-            self.log("DOWNLOAD_SUCCESS_FROM", media_url=media_url)
+            if is_duplicate:
+                with self.file_lock:
+                    self.duplicate_files.append(media_url)
+                self.log("DUPLICATE_FILE_REMOVED", media_url=media_url, existing=saved_path)
+            else:
+                self.log("DOWNLOAD_SUCCESS_FROM", media_url=media_url)
             self._emit_global_progress()
-
-            with self.db_lock:
-                self.db_cursor.execute(
-                    """
-                    INSERT OR REPLACE INTO downloads (media_url, file_path, file_size, user_id, post_id)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (record_url, final_path, total_size, user_id, post_id),
-                )
-                self.db_connection.commit()
-                self.download_cache[record_url] = (final_path, total_size)
 
         except Exception as e:
             if os.path.exists(tmp_path):

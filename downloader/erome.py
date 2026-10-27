@@ -17,6 +17,7 @@ class EromeDownloader(BaseApiDownloader):
             should_cancel=self.cancel_requested.is_set,
             max_retries=self.max_retries,
             retry_interval=self.retry_interval,
+            cache_db_path=self.db_path,
         )
         self.domain_name = "erome"
 

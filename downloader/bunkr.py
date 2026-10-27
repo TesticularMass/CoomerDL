@@ -1,8 +1,20 @@
 import os
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from downloader.core.base_api_downloader import BaseApiDownloader
 from downloader.adapters.bunkr_adapter import BunkrAdapter
 from downloader.adapters.http_retry import ScrapeCancelled
+
+# Signing parameters change on every visit, so they must not be part of
+# the database key or the same file would never be recognised again.
+VOLATILE_QUERY_KEYS = {"token", "ex"}
+
+
+def stable_record_url(url):
+    parsed = urlparse(url)
+    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+             if k not in VOLATILE_QUERY_KEYS]
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 class BunkrDownloader(BaseApiDownloader):
@@ -35,6 +47,7 @@ class BunkrDownloader(BaseApiDownloader):
                     post_time=entry["published"],
                     download_id=entry["media_url"],
                     target_folder=target_folder,
+                    record_url=stable_record_url(entry["media_url"]),
                 ),
             )
         except ScrapeCancelled:
