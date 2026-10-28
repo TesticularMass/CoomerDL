@@ -7,6 +7,9 @@ from bs4 import BeautifulSoup
 from downloader.adapters.http_retry import MAX_RETRY_DELAY, RetryingScraper, ScrapeCancelled
 from downloader.adapters.resolution_cache import ResolutionCache
 
+# "Added 2021-10-19 05:33:20 +0000 UTC" on post pages.
+_POST_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?")
+
 
 class CoomerfansAdapter(RetryingScraper):
     site_name = "coomerfans"
@@ -46,6 +49,25 @@ class CoomerfansAdapter(RetryingScraper):
     @staticmethod
     def clean_filename(filename):
         return re.sub(r'[<>:"/\\|?*]', "_", str(filename).split("?")[0])
+
+    @staticmethod
+    def _scrape_post_info(soup):
+        """
+        Returns the post title and date shown on a post page, such as
+        ("On or off?", "2021-10-19T05:33:20"). Either may be empty.
+        """
+        wrap = soup.find("div", class_="post-wrap") or soup
+        heading = wrap.find("h1")
+        title = heading.get_text(" ", strip=True) if heading else ""
+
+        published = ""
+        date_el = wrap.find(class_="post-date")
+        if date_el:
+            match = _POST_DATE_RE.search(date_el.get_text(" ", strip=True))
+            if match:
+                published = match.group(1) + (f"T{match.group(2)}" if match.group(2) else "")
+
+        return title, published
 
     def _resolve_profile(self, profile_url, download_images=True, download_videos=True, only_first_page=False, on_media=None):
         """
@@ -291,7 +313,15 @@ class CoomerfansAdapter(RetryingScraper):
             folder_name = self.clean_filename(f"{service}_post_{post_id}")
             entry_user_id = profile_user_id or self.clean_filename(f"{service}_{user_id}")
 
-            raw_media = self._post_cache.load(post_url)
+            # Entries cached before titles and dates were scraped hold a bare
+            # media list; they count as misses so the post is read again.
+            cached = self._post_cache.load(post_url)
+            raw_media = None
+            title = published = ""
+            if isinstance(cached, dict) and isinstance(cached.get("media"), list):
+                raw_media = cached["media"]
+                title = cached.get("title") or ""
+                published = cached.get("published") or ""
             if isinstance(raw_media, list):
                 now = time.time()
                 for item in raw_media:
@@ -304,10 +334,15 @@ class CoomerfansAdapter(RetryingScraper):
                 self.log("COOMERFANS_PROCESSING_POST", url=post_url, post_id=post_id)
                 soup = self._request_soup(post_url)
                 raw_media = self._scrape_post_media(soup, post_url)
+                title, published = self._scrape_post_info(soup)
                 # An empty result may be a page that failed to render;
                 # caching it would hide the post until the entry expires.
                 if raw_media:
-                    self._post_cache.store(post_url, raw_media)
+                    self._post_cache.store(post_url, {
+                        "media": raw_media,
+                        "title": title,
+                        "published": published,
+                    })
             else:
                 self._cache_hits += 1
 
@@ -325,8 +360,8 @@ class CoomerfansAdapter(RetryingScraper):
                     "media_url": m_url,
                     "record_url": f"https://coomerfans.com{stable_path}" if stable_path else m_url,
                     "post_id": post_id,
-                    "title": folder_name,
-                    "published": "",
+                    "title": title,
+                    "published": published,
                     "user_id": entry_user_id,
                     "resource_type": resource_type,
                 })
