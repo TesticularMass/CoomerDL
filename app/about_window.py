@@ -1,6 +1,5 @@
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -14,16 +13,18 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QWidget,
-    QScrollArea,
 )
 
 ABOUT_HEADERS = {"User-Agent": "CoomerDL-About"}
+DEVELOPER = "TesticularMass"
+REPO = f"{DEVELOPER}/CoomerDL"
+DEVELOPER_URL = f"https://github.com/{DEVELOPER}"
+REPO_URL = f"https://github.com/{REPO}"
+REPO_API_URL = f"https://api.github.com/repos/{REPO}"
 
 
 class AboutWindow(QDialog):
     _github_loaded = Signal(str, int, int, object)
-    _contributors_loaded = Signal(list)
-    _contributors_failed = Signal(str)
 
     def __init__(self, parent, translate, version):
         super().__init__(parent)
@@ -33,7 +34,7 @@ class AboutWindow(QDialog):
 
         self.setWindowTitle(self.translate("ABOUT_WINDOW_TITLE"))
         self.setModal(True)
-        self.setFixedSize(380, 560)
+        self.setFixedSize(380, 400)
 
         if self.parent is not None:
             self.setWindowModality(Qt.WindowModal)
@@ -42,15 +43,11 @@ class AboutWindow(QDialog):
         self.date_label = None
         self.stars_button = None
         self.dev_icon_label = None
-        self.contributors_strip_layout = None
 
         self._github_loaded.connect(self._update_github_labels)
-        self._contributors_loaded.connect(self._render_contributors)
-        self._contributors_failed.connect(self._render_contributors_error)
 
         self._build_ui()
         threading.Thread(target=self._fetch_github_data, daemon=True).start()
-        threading.Thread(target=self._fetch_contributors, daemon=True).start()
 
     def _build_ui(self):
         self.setStyleSheet(
@@ -149,7 +146,7 @@ class AboutWindow(QDialog):
         details = [
             (
                 "resources/img/iconos/about/user-account-solid-24.png",
-                f"{self.translate('DEVELOPER_LABEL')}: Emy69",
+                f"{self.translate('DEVELOPER_LABEL')}: {DEVELOPER}",
                 "developer",
             ),
             (
@@ -179,12 +176,12 @@ class AboutWindow(QDialog):
                 self.date_label = text_label
             elif key == "developer":
                 row.setCursor(Qt.PointingHandCursor)
-                row.setToolTip("https://github.com/Emy69")
+                row.setToolTip(DEVELOPER_URL)
                 text_label.setStyleSheet(
                     "color: #7aa7ff; text-decoration: underline;"
                 )
                 row.mousePressEvent = (
-                    lambda _ev: self._open_url("https://github.com/Emy69")
+                    lambda _ev: self._open_url(DEVELOPER_URL)
                 )
                 self.dev_icon_label = row.icon_label
 
@@ -221,60 +218,15 @@ class AboutWindow(QDialog):
             btn.clicked.connect(lambda: self._open_url(url))
             return btn
 
-        self.discord_button = _make_social(
-            "discord-alt-logo-24.png", "Discord", "https://discord.gg/6zbjrJbJ3Q"
-        )
         self.stars_button = _make_social(
             "github-logo-24.png",
             "GitHub",
-            "https://github.com/Emy69/CoomerDL",
+            REPO_URL,
             text=f"★ {self.translate('LOADING')}",
         )
-        self.patron_button = _make_social(
-            "patreon-logo-24.png", "Patreon", "https://www.patreon.com/Emy69"
-        )
-        self.x_button = _make_social(
-            "twitter-x-fill.png", "X (Twitter)", "https://x.com/dev_emy"
-        )
-
-        for btn in (self.discord_button, self.stars_button, self.patron_button, self.x_button):
-            socials_row.addWidget(btn, 1)
+        socials_row.addWidget(self.stars_button, 1)
 
         card_layout.addLayout(socials_row)
-
-        contributors_separator = QFrame()
-        contributors_separator.setProperty("role", "separator")
-        card_layout.addWidget(contributors_separator)
-
-        self.contributors_label = QLabel(self.translate("CONTRIBUTORS_SECTION"))
-        self.contributors_label.setProperty("role", "section")
-        self.contributors_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.contributors_label.setCursor(Qt.PointingHandCursor)
-        self.contributors_label.mousePressEvent = lambda _ev: self._open_url(
-            "https://github.com/Emy69/CoomerDL/graphs/contributors"
-        )
-        card_layout.addWidget(self.contributors_label)
-
-        self.contributors_strip = QScrollArea()
-        self.contributors_strip.setWidgetResizable(True)
-        self.contributors_strip.setFixedHeight(96)
-        self.contributors_strip.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.contributors_strip.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        strip_content = QWidget()
-        self.contributors_strip_layout = QHBoxLayout(strip_content)
-        self.contributors_strip_layout.setContentsMargins(4, 4, 4, 4)
-        self.contributors_strip_layout.setSpacing(10)
-        self.contributors_strip_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-
-        self.contributors_status_label = QLabel(self.translate("LOADING"))
-        self.contributors_status_label.setProperty("role", "body")
-        self.contributors_status_label.setAlignment(Qt.AlignCenter)
-        self.contributors_strip_layout.addWidget(self.contributors_status_label)
-        self.contributors_strip_layout.addStretch()
-
-        self.contributors_strip.setWidget(strip_content)
-        card_layout.addWidget(self.contributors_strip)
 
         card_layout.addStretch()
 
@@ -317,7 +269,7 @@ class AboutWindow(QDialog):
     def _fetch_github_data(self):
         avatar_bytes = None
         try:
-            repo_data = requests.get("https://api.github.com/repos/Emy69/CoomerDL", timeout=15).json()
+            repo_data = requests.get(REPO_API_URL, timeout=15).json()
             created_at = repo_data.get("created_at", "N/A")
             created_date = created_at.split("T")[0] if created_at != "N/A" else "N/A"
             stars = int(repo_data.get("stargazers_count", 0))
@@ -331,7 +283,7 @@ class AboutWindow(QDialog):
                     for asset in release.get("assets", [])
                 )
             try:
-                av = requests.get("https://github.com/Emy69.png", headers=ABOUT_HEADERS, timeout=15)
+                av = requests.get(f"{DEVELOPER_URL}.png", headers=ABOUT_HEADERS, timeout=15)
                 av.raise_for_status()
                 avatar_bytes = bytes(av.content)
             except Exception:
@@ -339,46 +291,6 @@ class AboutWindow(QDialog):
             self._github_loaded.emit(created_date, total_downloads, stars, avatar_bytes)
         except Exception:
             self._github_loaded.emit("N/A", 0, 0, avatar_bytes)
-
-    def _fetch_contributors(self):
-        try:
-            response = requests.get(
-                "https://api.github.com/repos/Emy69/CoomerDL/contributors",
-                headers={**ABOUT_HEADERS, "Accept": "application/vnd.github+json"},
-                params={"per_page": 100},
-                timeout=15,
-            )
-            response.raise_for_status()
-            data = response.json()
-            contributors = [
-                {
-                    "login": c.get("login") or "",
-                    "avatar_url": c.get("avatar_url") or "",
-                    "html_url": c.get("html_url") or f"https://github.com/{c.get('login') or ''}",
-                    "contributions": int(c.get("contributions") or 0),
-                    "avatar_bytes": None,
-                }
-                for c in (data if isinstance(data, list) else [])
-                if c.get("type") != "Bot" and (c.get("login") or "").lower() != "emy69"
-            ]
-
-            def fetch_avatar(item):
-                url = item["avatar_url"]
-                if url:
-                    try:
-                        r = requests.get(url, headers=ABOUT_HEADERS, timeout=15)
-                        r.raise_for_status()
-                        item["avatar_bytes"] = bytes(r.content)
-                    except Exception:
-                        pass
-                return item
-
-            if contributors:
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    contributors = list(pool.map(fetch_avatar, contributors))
-            self._contributors_loaded.emit(contributors)
-        except Exception as exc:
-            self._contributors_failed.emit(str(exc))
 
     def _update_github_labels(self, created_date: str, total_downloads: int, stars: int, avatar_bytes):
         if self.date_label is not None:
@@ -391,75 +303,6 @@ class AboutWindow(QDialog):
             pixmap = self._build_circular_avatar(avatar_bytes, size=20)
             if pixmap is not None:
                 self.dev_icon_label.setPixmap(pixmap)
-
-    def _clear_contributors_strip(self):
-        if self.contributors_strip_layout is None:
-            return
-        while self.contributors_strip_layout.count():
-            item = self.contributors_strip_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-    def _render_contributors_error(self, _err):
-        self._clear_contributors_strip()
-        label = QLabel(self.translate("CONTRIBUTORS_LOAD_FAILED"))
-        label.setProperty("role", "body")
-        label.setAlignment(Qt.AlignCenter)
-        self.contributors_strip_layout.addWidget(label)
-        self.contributors_strip_layout.addStretch()
-
-    def _render_contributors(self, contributors):
-        self._clear_contributors_strip()
-
-        if not contributors:
-            label = QLabel(self.translate("NO_CONTRIBUTORS_FOUND"))
-            label.setProperty("role", "body")
-            label.setAlignment(Qt.AlignCenter)
-            self.contributors_strip_layout.addWidget(label)
-            self.contributors_strip_layout.addStretch()
-            return
-
-        for contributor in contributors:
-            login = contributor.get("login") or "?"
-            profile_url = contributor.get("html_url") or f"https://github.com/{login}"
-            contributions = contributor.get("contributions") or 0
-            avatar_bytes = contributor.get("avatar_bytes")
-
-            cell = QWidget()
-            cell.setCursor(Qt.PointingHandCursor)
-            cell.setToolTip(f"{login} — {contributions} commits")
-            cell.mousePressEvent = lambda _ev, u=profile_url: self._open_url(u)
-
-            cell_layout = QVBoxLayout(cell)
-            cell_layout.setContentsMargins(2, 2, 2, 2)
-            cell_layout.setSpacing(4)
-            cell_layout.setAlignment(Qt.AlignCenter)
-
-            avatar_label = QLabel()
-            avatar_label.setFixedSize(48, 48)
-            avatar_label.setAlignment(Qt.AlignCenter)
-
-            pixmap = self._build_circular_avatar(avatar_bytes)
-            if pixmap is not None:
-                avatar_label.setPixmap(pixmap)
-                avatar_label.setStyleSheet("background: transparent;")
-            else:
-                avatar_label.setStyleSheet(
-                    "background-color: #3a3a3a; border-radius: 24px;"
-                )
-
-            name_label = QLabel(login if len(login) <= 10 else login[:9] + "…")
-            name_label.setStyleSheet("font-size: 11px; color: #e0e0e0;")
-            name_label.setAlignment(Qt.AlignCenter)
-            name_label.setFixedWidth(76)
-
-            cell_layout.addWidget(avatar_label, 0, Qt.AlignHCenter)
-            cell_layout.addWidget(name_label, 0, Qt.AlignHCenter)
-
-            self.contributors_strip_layout.addWidget(cell)
-
-        self.contributors_strip_layout.addStretch()
 
     @staticmethod
     def _build_circular_avatar(data, size=48):

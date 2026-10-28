@@ -38,8 +38,6 @@ from app.views.pyside.widgets.footer_bar import FooterBar
 from app.views.pyside.dialogs.settings_dialog import SettingsDialog
 from app.views.pyside.progress.progress_controller import ProgressController
 from app.about_window import AboutWindow
-from app.donors import DonorsModal
-from app.views.pyside.dialogs.startup_community_dialog import StartupCommunityDialog
 
 VERSION = f"V{APP_VERSION}"
 MAX_LOG_LINES = 500
@@ -129,8 +127,7 @@ class PySideMainWindow(QMainWindow):
         self._last_footer_activity_ts = 0.0
         self._footer_hold_seconds = 1.0
 
-        self.hide()
-        QTimer.singleShot(0, self.show_startup_community_dialog)
+        self.show()
 
     # ------------------------------------------------------------------
     # UI
@@ -153,10 +150,6 @@ class PySideMainWindow(QMainWindow):
         self.help_action = QAction("About", self)
         self.help_action.triggered.connect(self.open_about_window)
         menu_bar.addAction(self.help_action)
-
-        self.support_action = QAction("Patreons", self)
-        self.support_action.triggered.connect(self.open_donors_modal)
-        menu_bar.addAction(self.support_action)
 
         
 
@@ -199,30 +192,6 @@ class PySideMainWindow(QMainWindow):
         dialog = AboutWindow(self, self.tr, self.version)
         dialog.show_about()
     
-    def open_donors_modal(self):
-        dialog = DonorsModal(self, self.tr)
-        dialog.show_modal()
-    
-    def show_startup_community_dialog(self):
-        should_show = self.settings_service.get("startup_show_community_message", True)
-
-        if not should_show:
-            self.show()
-            return
-
-        dialog = StartupCommunityDialog(
-            parent=self,
-            initial_language=self.language
-        )
-
-        if dialog.exec():
-            selected_language = dialog.selected_language()
-            self.save_language_preference(selected_language)
-            self.load_translations(selected_language)
-            self.update_ui_texts()
-
-        self.show()
-
     def load_translations(self, language=None):
         target_language = language or self.language
         self.language = target_language
@@ -250,8 +219,6 @@ class PySideMainWindow(QMainWindow):
             self.settings_action.setText(self.tr("Settings"))
         if hasattr(self, "help_action"):
             self.help_action.setText(self.tr("About"))
-        if hasattr(self, "support_action"):
-            self.support_action.setText(self.tr("Patreons"))
 
         if hasattr(self, "footer_bar") and hasattr(self.footer_bar, "progress_details_button"):
             self.footer_bar.progress_details_button.setToolTip(self.tr("PROGRESS_DETAILS"))

@@ -25,8 +25,8 @@ def main():
 
     app_icon = QIcon("resources/img/icono.ico")
     app.setWindowIcon(app_icon)
-    
-    # The window shows itself after the startup community dialog resolves
+
+    # The window shows itself once it is built
     window = PySideMainWindow()
     sys.exit(app.exec())
 

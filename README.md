@@ -40,7 +40,7 @@ CoomerDL is a desktop app that downloads images, videos and files from supported
 
 It is built with Python and a **PySide6 (Qt)** interface.
 
-This project started as a fork of [Emy69/CoomerDL](https://github.com/Emy69/CoomerDL). Since then the codebase has been simplified (dead code and duplicated downloader logic removed, one shared batch runner for every site), several download bugs have been fixed, and new options have been added for where and how files are saved. The commit history has the details.
+This project started as a fork of CoomerDL. Since then the codebase has been simplified (dead code and duplicated downloader logic removed, one shared batch runner for every site), several download bugs have been fixed, and new options have been added for where and how files are saved. The commit history has the details.
 
 ## What this fork adds
 
@@ -254,6 +254,6 @@ Feature requests are welcome as [issues](https://github.com/TesticularMass/Coome
 
 ## Credits
 
-- Original app by [Emy69](https://github.com/Emy69/CoomerDL), released under the MIT License. Emy69 also maintains [Coomer CLI](https://github.com/Emy69/Coomer-cli) and [SimpCity CLI](https://github.com/Emy69/SimpCityCLI).
+- Based on CoomerDL, released under the MIT License. The original copyright notice is kept in [LICENSE](LICENSE).
 - Fork maintained by [TesticularMass](https://github.com/TesticularMass).
 - Translators and contributors are listed in the commit history.
